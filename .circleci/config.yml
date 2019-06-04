@@ -39,6 +39,26 @@ jobs:
             make -j regressiontest; make clean
             make shortest         ; make clean
             make cxxtest          ; make clean
+
+  short-tests-2:
+    # TODO: Create a small custom docker image with all the dependencies we need
+    #       preinstalled to reduce installation time.
+    docker:
+      - image: ephiepark/zstd-circleci-primary:0.0.1
+    steps:
+      - checkout
+      - *install-dependencies
+      - run:
+          name: Test
+          command: |
+            cc -v; CFLAGS="-O0 -Werror" make all && make clean
+            make c99build         ; make clean
+            make c11build         ; make clean
+            make aarch64build     ; make clean
+            make -j regressiontest; make clean
+            make shortest         ; make clean
+            make cxxtest          ; make clean
+
   # the second half of the jobs are in this test
   short-tests-1:
     docker:
