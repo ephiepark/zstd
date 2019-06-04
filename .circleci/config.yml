@@ -1,22 +1,22 @@
 version: 2
 
-# references:
-#   # Install the dependencies required for tests.
-#   # Add the step "- *install-dependencies" to the beginning of your job to run
-#   # this command.
-#   install-dependencies: &install-dependencies
-#     run:
-#       name: Install dependencies
-#       # TODO: We can split these dependencies up by job to reduce installation
-#       # time.
-#       command: |
-#         sudo dpkg --add-architecture i386
-#         sudo apt-get -y -qq update
-#         sudo apt-get -y install \
-#             gcc-multilib-powerpc-linux-gnu gcc-arm-linux-gnueabi \
-#             libc6-dev-armel-cross gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
-#             libc6-dev-ppc64-powerpc-cross zstd gzip coreutils \
-#             libcurl4-openssl-dev
+references:
+  # Install the dependencies required for tests.
+  # Add the step "- *install-dependencies" to the beginning of your job to run
+  # this command.
+  install-dependencies: &install-dependencies
+    run:
+      name: Install dependencies
+      # TODO: We can split these dependencies up by job to reduce installation
+      # time.
+      # command: |
+      #   sudo dpkg --add-architecture i386
+      #   sudo apt-get -y -qq update
+      #   sudo apt-get -y install \
+      #       gcc-multilib-powerpc-linux-gnu gcc-arm-linux-gnueabi \
+      #       libc6-dev-armel-cross gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+      #       libc6-dev-ppc64-powerpc-cross zstd gzip coreutils \
+      #       libcurl4-openssl-dev
 
 jobs:
   # the first half of the jobs are in this test
@@ -24,7 +24,7 @@ jobs:
     # TODO: Create a small custom docker image with all the dependencies we need
     #       preinstalled to reduce installation time.
     docker:
-      - image: ephiepark/zstd-circleci-primary:0.0.1
+      - image: circleci/buildpack-deps:bionic # ephiepark/zstd-circleci-primary:0.0.1
     steps:
       - checkout
       - *install-dependencies
