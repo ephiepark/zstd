@@ -12,13 +12,22 @@ jobs:
       - run:
           name: Test
           command: |
+            NOW="date +%s"
+            START=`$NOW`
             cc -v; CFLAGS="-O0 -Werror" make all && make clean
+            echo "Command 1 took $((`$NOW` - START)) seconds" ; START=`date +%s`
             make c99build         ; make clean
+            echo "Command 2 took $((`$NOW` - START)) seconds" ; START=`date +%s`
             make c11build         ; make clean
+            echo "Command 3 took $((`$NOW` - START)) seconds" ; START=`date +%s`
             make aarch64build     ; make clean
+            echo "Command 4 took $((`$NOW` - START)) seconds" ; START=`date +%s`
             make -j regressiontest; make clean
+            echo "Command 5 took $((`$NOW` - START)) seconds" ; START=`date +%s`
             make shortest         ; make clean
+            echo "Command 6 took $((`$NOW` - START)) seconds" ; START=`date +%s`
             make cxxtest          ; make clean
+            echo "Command 7 took $((`$NOW` - START)) seconds" ; START=`date +%s`
   # the second half of the jobs are in this test
   short-tests-1:
     docker:
@@ -28,13 +37,22 @@ jobs:
       - run:
           name: Test
           command: |
+            NOW="date +%s"
+            START=`$NOW`
             make gnu90build; make clean
+            echo "Command 1 took $((`$NOW` - START)) seconds" ; START=`date +%s`
             make gnu99build; make clean
+            echo "Command 2 took $((`$NOW` - START)) seconds" ; START=`date +%s`
             make ppc64build; make clean
+            echo "Command 3 took $((`$NOW` - START)) seconds" ; START=`date +%s`
             make ppcbuild  ; make clean
+            echo "Command 4 took $((`$NOW` - START)) seconds" ; START=`date +%s`
             make armbuild  ; make clean
+            echo "Command 5 took $((`$NOW` - START)) seconds" ; START=`date +%s`
             make -C tests test-legacy test-longmatch test-symbols; make clean
+            echo "Command 6 took $((`$NOW` - START)) seconds" ; START=`date +%s`
             make -C lib libzstd-nomt; make clean
+            echo "Command 7 took $((`$NOW` - START)) seconds" ; START=`date +%s`
   # This step is only run on release tags.
   # It publishes the source tarball as artifacts and if the GITHUB_TOKEN
   # environment variable is set it will publish the source tarball to the
