@@ -44,7 +44,7 @@ jobs:
     # TODO: Create a small custom docker image with all the dependencies we need
     #       preinstalled to reduce installation time.
     docker:
-      - image: ephiepark/zstd-circleci-primary:0.0.1
+      - image: fbopensource/zstd-circleci-primary:0.0.1
     steps:
       - checkout
       - *install-dependencies
