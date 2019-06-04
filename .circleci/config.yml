@@ -149,7 +149,7 @@ jobs:
 
 
 workflows:
-  version: 2
+  version: 3
   commit:
     jobs:
       # Run the tests in parallel
@@ -158,6 +158,10 @@ workflows:
             tags:
               only: /.*/
       - short-tests-1:
+          filters:
+            tags:
+              only: /.*/
+      - short-tests-2:
           filters:
             tags:
               only: /.*/
@@ -173,6 +177,7 @@ workflows:
           requires:
             - short-tests-0
             - short-tests-1
+            - short-tests-2
           filters:
             branches:
               ignore: /.*/
