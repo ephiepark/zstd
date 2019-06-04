@@ -9,7 +9,8 @@ references:
       name: Install dependencies
       # TODO: We can split these dependencies up by job to reduce installation
       # time.
-      # command: |
+      command: |
+         sudo echo hi
       #   sudo dpkg --add-architecture i386
       #   sudo apt-get -y -qq update
       #   sudo apt-get -y install \
