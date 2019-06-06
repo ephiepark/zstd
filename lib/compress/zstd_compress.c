@@ -2716,6 +2716,110 @@ void ZSTD_resetSeqStore(seqStore_t* ssPtr)
     ssPtr->longLengthID = 0;
 }
 
+static size_t ZSTD_compressSuperBlock(ZSTD_CCtx* zc,
+                                      void* dst, size_t dstCapacity,
+                                      const void* src, size_t srcSize, U32 lastBlock)
+{
+    ZSTD_matchState_t* const ms = &zc->blockState.matchState;
+    size_t cSize;
+    DEBUGLOG(5, "ZSTD_compressBlock_internal (dstCapacity=%u, dictLimit=%u, nextToUpdate=%u)",
+                (unsigned)dstCapacity, (unsigned)ms->window.dictLimit, (unsigned)ms->nextToUpdate);
+    assert(srcSize <= ZSTD_BLOCKSIZE_MAX);
+
+    /* Assert that we have correctly flushed the ctx params into the ms's copy */
+    ZSTD_assertEqualCParams(zc->appliedParams.cParams, ms->cParams);
+
+    if (srcSize < MIN_CBLOCK_SIZE+ZSTD_blockHeaderSize+1) {
+        ZSTD_ldm_skipSequences(&zc->externSeqStore, srcSize, zc->appliedParams.cParams.minMatch);
+        cSize = 0;
+        goto out;  /* don't even attempt compression below a certain srcSize */
+    }
+    ZSTD_resetSeqStore(&(zc->seqStore));
+    /* required for optimal parser to read stats from dictionary */
+    ms->opt.symbolCosts = &zc->blockState.prevCBlock->entropy;
+    /* tell the optimal parser how we expect to compress literals */
+    ms->opt.literalCompressionMode = zc->appliedParams.literalCompressionMode;
+
+    /* a gap between an attached dict and the current window is not safe,
+     * they must remain adjacent,
+     * and when that stops being the case, the dict must be unset */
+    assert(ms->dictMatchState == NULL || ms->loadedDictEnd == ms->window.dictLimit);
+
+    /* limited update after a very long match */
+    {   const BYTE* const base = ms->window.base;
+        const BYTE* const istart = (const BYTE*)src;
+        const U32 current = (U32)(istart-base);
+        if (sizeof(ptrdiff_t)==8) assert(istart - base < (ptrdiff_t)(U32)(-1));   /* ensure no overflow */
+        if (current > ms->nextToUpdate + 384)
+            ms->nextToUpdate = current - MIN(192, (U32)(current - ms->nextToUpdate - 384));
+    }
+
+    /* select and store sequences */
+    {   ZSTD_dictMode_e const dictMode = ZSTD_matchState_dictMode(ms);
+        size_t lastLLSize;
+        {   int i;
+            for (i = 0; i < ZSTD_REP_NUM; ++i)
+                zc->blockState.nextCBlock->rep[i] = zc->blockState.prevCBlock->rep[i];
+        }
+        if (zc->externSeqStore.pos < zc->externSeqStore.size) {
+            assert(!zc->appliedParams.ldmParams.enableLdm);
+            /* Updates ldmSeqStore.pos */
+            lastLLSize =
+                ZSTD_ldm_blockCompress(&zc->externSeqStore,
+                                       ms, &zc->seqStore,
+                                       zc->blockState.nextCBlock->rep,
+                                       src, srcSize);
+            assert(zc->externSeqStore.pos <= zc->externSeqStore.size);
+        } else if (zc->appliedParams.ldmParams.enableLdm) {
+            rawSeqStore_t ldmSeqStore = {NULL, 0, 0, 0};
+
+            ldmSeqStore.seq = zc->ldmSequences;
+            ldmSeqStore.capacity = zc->maxNbLdmSequences;
+            /* Updates ldmSeqStore.size */
+            FORWARD_IF_ERROR(ZSTD_ldm_generateSequences(&zc->ldmState, &ldmSeqStore,
+                                               &zc->appliedParams.ldmParams,
+                                               src, srcSize));
+            /* Updates ldmSeqStore.pos */
+            lastLLSize =
+                ZSTD_ldm_blockCompress(&ldmSeqStore,
+                                       ms, &zc->seqStore,
+                                       zc->blockState.nextCBlock->rep,
+                                       src, srcSize);
+            assert(ldmSeqStore.pos == ldmSeqStore.size);
+        } else {   /* not long range mode */
+            ZSTD_blockCompressor const blockCompressor = ZSTD_selectBlockCompressor(zc->appliedParams.cParams.strategy, dictMode);
+            lastLLSize = blockCompressor(ms, &zc->seqStore, zc->blockState.nextCBlock->rep, src, srcSize);
+        }
+        {   const BYTE* const lastLiterals = (const BYTE*)src + srcSize - lastLLSize;
+            ZSTD_storeLastLiterals(&zc->seqStore, lastLiterals, lastLLSize);
+    }   }
+
+    /* encode sequences and literals */
+    cSize = ZSTD_compressSequences(&zc->seqStore,
+            &zc->blockState.prevCBlock->entropy, &zc->blockState.nextCBlock->entropy,
+            &zc->appliedParams,
+            dst, dstCapacity,
+            srcSize,
+            zc->entropyWorkspace, HUF_WORKSPACE_SIZE /* statically allocated in resetCCtx */,
+            zc->bmi2);
+
+out:
+    if (!ZSTD_isError(cSize) && cSize != 0) {
+        /* confirm repcodes and entropy tables when emitting a compressed block */
+        ZSTD_compressedBlockState_t* const tmp = zc->blockState.prevCBlock;
+        zc->blockState.prevCBlock = zc->blockState.nextCBlock;
+        zc->blockState.nextCBlock = tmp;
+    }
+    /* We check that dictionaries have offset codes available for the first
+     * block. After the first block, the offcode table might not have large
+     * enough codes to represent the offsets in the data.
+     */
+    if (zc->blockState.prevCBlock->entropy.fse.offcode_repeatMode == FSE_repeat_valid)
+        zc->blockState.prevCBlock->entropy.fse.offcode_repeatMode = FSE_repeat_check;
+
+    return cSize;
+}
+
 static size_t ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
                                         void* dst, size_t dstCapacity,
                                         const void* src, size_t srcSize)
