@@ -2716,13 +2716,45 @@ void ZSTD_resetSeqStore(seqStore_t* ssPtr)
     ssPtr->longLengthID = 0;
 }
 
+static size_t ZSTD_buildEntropy(ZSTD_hufCTables_t const* prevHuf,
+                                ZSTD_hufCTables_t* nextHuf,
+                                ZSTD_strategy strategy, int disableLiteralCompression,
+                                void* dst, size_t dstCapacity,
+                          const void* src, size_t srcSize,
+                                void* workSpace, size_t wkspSize)
+{
+    size_t const minGain = ZSTD_minGain(srcSize, strategy);
+    U32 singleStream = srcSize < 256;
+
+    DEBUGLOG(5,"ZSTD_buildEntropy (disableLiteralCompression=%i, srcSize=%zu)",
+                disableLiteralCompression, srcSize);
+
+    /* Prepare nextEntropy assuming reusing the existing table */
+    memcpy(nextHuf, prevHuf, sizeof(*prevHuf));
+
+    if (disableLiteralCompression)
+        return 0;
+
+    /* small ? don't even attempt compression (speed opt) */
+#   define COMPRESS_LITERALS_SIZE_MIN 63
+    {   size_t const minLitSize = (prevHuf->repeatMode == HUF_repeat_valid) ? 6 : COMPRESS_LITERALS_SIZE_MIN;
+        if (srcSize <= minLitSize) return 0;
+    }
+
+    {   HUF_repeat repeat = prevHuf->repeatMode;
+        int const preferRepeat = strategy < ZSTD_lazy ? srcSize <= 1024 : 0;
+        return HUF_ephraim(dst, dstCapacity, src, srcSize, 255, 11, workSpace, wkspSize, (HUF_CElt*)nextHuf->CTable, &repeat, preferRepeat);
+    }
+}
+
 static size_t ZSTD_compressSuperBlock(ZSTD_CCtx* zc,
                                       void* dst, size_t dstCapacity,
                                       const void* src, size_t srcSize, U32 lastBlock)
 {
+    size_t lhSize = 5; // TODO fix this. Max size for now
     ZSTD_matchState_t* const ms = &zc->blockState.matchState;
     size_t cSize;
-    DEBUGLOG(5, "ZSTD_compressBlock_internal (dstCapacity=%u, dictLimit=%u, nextToUpdate=%u)",
+    DEBUGLOG(5, "ZSTD_compressSuperBlock (dstCapacity=%u, dictLimit=%u, nextToUpdate=%u)",
                 (unsigned)dstCapacity, (unsigned)ms->window.dictLimit, (unsigned)ms->nextToUpdate);
     assert(srcSize <= ZSTD_BLOCKSIZE_MAX);
 
@@ -2793,6 +2825,26 @@ static size_t ZSTD_compressSuperBlock(ZSTD_CCtx* zc,
         {   const BYTE* const lastLiterals = (const BYTE*)src + srcSize - lastLLSize;
             ZSTD_storeLastLiterals(&zc->seqStore, lastLiterals, lastLLSize);
     }   }
+
+    {   const BYTE* const literals = zc->seqStore.litStart;
+        size_t const litSize = zc->seqStore.lit - literals;
+        size_t const lhSize = 3 + (litSize >= 1 KB) + (litSize >= 16 KB);
+        {   BYTE* const ostart = (BYTE*)dst;
+            BYTE* const oend = ostart + dstCapacity;
+            BYTE* op = ostart + ZSTD_blockHeaderSize + lhSize;
+            size_t const hSize = ZSTD_buildEntropy(
+                &zc->blockState.prevCBlock->entropy.huf,
+                &zc->blockState.nextCBlock->entropy.huf,
+                zc->appliedParams.cParams.strategy,
+                ZSTD_disableLiteralsCompression(&zc->appliedParams),
+                op, oend-op, 
+                literals, litSize,
+                zc->entropyWorkspace, HUF_WORKSPACE_SIZE /* statically allocated in resetCCtx */
+            );
+            DEBUGLOG(5, "ZSTD_compressSuperBlock (hSize=%zu)", hSize);
+        }
+    }
+    // TODO ZSTD_compressSubBlock() in a loop, it should return compressed size
 
     /* encode sequences and literals */
     cSize = ZSTD_compressSequences(&zc->seqStore,
@@ -2976,9 +3028,9 @@ static size_t ZSTD_compress_frameChunk (ZSTD_CCtx* cctx,
         /* Ensure hash/chain table insertion resumes no sooner than lowlimit */
         if (ms->nextToUpdate < ms->window.lowLimit) ms->nextToUpdate = ms->window.lowLimit;
 
-        {   size_t cSize = ZSTD_compressBlock_internal(cctx,
+        {   size_t cSize = ZSTD_compressSuperBlock(cctx,
                                 op+ZSTD_blockHeaderSize, dstCapacity-ZSTD_blockHeaderSize,
-                                ip, blockSize);
+                                ip, blockSize, lastBlock);
             FORWARD_IF_ERROR(cSize);
 
             if (cSize == 0) {  /* block is not compressible */

@@ -634,6 +634,85 @@ typedef struct {
     huffNodeTable nodeTable;
 } HUF_compress_tables_t;
 
+// Returning hSize in compress with huffman
+// Otherwise returning 0 for uncompressed, 1 for rle, 2 for repeat
+// This is assuming hSize is at minimum > 2
+// Is this safe...?
+size_t HUF_ephraim (void* dst, size_t dstSize,
+                    const void* src, size_t srcSize,
+                    unsigned maxSymbolValue, unsigned huffLog,
+                    void* workSpace, size_t wkspSize,
+                    HUF_CElt* oldHufTable, HUF_repeat* repeat, int preferRepeat)
+{
+    BYTE* const ostart = (BYTE*)dst;
+    BYTE* const oend = ostart + dstSize;
+    BYTE* op = ostart;
+    HUF_compress_tables_t* const table = (HUF_compress_tables_t*)workSpace;
+
+    if (((size_t)workSpace & 3) != 0) return ERROR(GENERIC);  /* must be aligned on 4-bytes boundaries */
+    if (wkspSize < HUF_WORKSPACE_SIZE) return ERROR(workSpace_tooSmall);
+    if (!srcSize) return 0;   /* Uncompressed */
+    if (srcSize > HUF_BLOCKSIZE_MAX) return ERROR(srcSize_wrong);   /* current block size limit */
+    if (huffLog > HUF_TABLELOG_MAX) return ERROR(tableLog_tooLarge);
+    if (maxSymbolValue > HUF_SYMBOLVALUE_MAX) return ERROR(maxSymbolValue_tooLarge);
+    if (!maxSymbolValue) maxSymbolValue = HUF_SYMBOLVALUE_MAX;
+    if (!huffLog) huffLog = HUF_TABLELOG_DEFAULT;
+
+    /* Heuristic : If old table is valid, use it for small inputs */
+    if (preferRepeat && repeat && *repeat == HUF_repeat_valid) {
+        return 2;
+    }
+
+    /* Scan input and build symbol stats */
+    {   CHECK_V_F(largest, HIST_count_wksp (table->count, &maxSymbolValue, (const BYTE*)src, srcSize, workSpace, wkspSize) );
+        if (largest == srcSize) return 1;   /* single symbol, rle */
+        if (largest <= (srcSize >> 7)+4) return 0;   /* heuristic : probably not compressible enough */
+    }
+
+    /* Check validity of previous table */
+    if ( repeat
+      && *repeat == HUF_repeat_check
+      && !HUF_validateCTable(oldHufTable, table->count, maxSymbolValue)) {
+        *repeat = HUF_repeat_none;
+    }
+    /* Heuristic : use existing table for small inputs */
+    if (preferRepeat && repeat && *repeat != HUF_repeat_none) {
+        return 2;
+    }
+
+    /* Build Huffman Tree */
+    huffLog = HUF_optimalTableLog(huffLog, srcSize, maxSymbolValue);
+    {   size_t const maxBits = HUF_buildCTable_wksp(table->CTable, table->count,
+                                            maxSymbolValue, huffLog,
+                                            table->nodeTable, sizeof(table->nodeTable));
+        CHECK_F(maxBits);
+        huffLog = (U32)maxBits;
+        /* Zero unused symbols in CTable, so we can check it for validity */
+        memset(table->CTable + (maxSymbolValue + 1), 0,
+               sizeof(table->CTable) - ((maxSymbolValue + 1) * sizeof(HUF_CElt)));
+    }
+
+    /* Write table description header */
+    {   CHECK_V_F(hSize, HUF_writeCTable (op, dstSize, table->CTable, maxSymbolValue, huffLog) );
+        /* Check if using previous huffman table is beneficial */
+        if (repeat && *repeat != HUF_repeat_none) {
+            size_t const oldSize = HUF_estimateCompressedSize(oldHufTable, table->count, maxSymbolValue);
+            size_t const newSize = HUF_estimateCompressedSize(table->CTable, table->count, maxSymbolValue);
+            if (oldSize <= hSize + newSize || hSize + 12 >= srcSize) {
+                return 2;
+        }   }
+
+        /* Use the new huffman table */
+        if (hSize + 12ul >= srcSize) { return 0; }
+        op += hSize;
+        if (repeat) { *repeat = HUF_repeat_none; }
+        if (oldHufTable)
+            memcpy(oldHufTable, table->CTable, sizeof(table->CTable));  /* Save new table */
+    }
+    return op-ostart;
+}
+
+
 /* HUF_compress_internal() :
  * `workSpace` must a table of at least HUF_WORKSPACE_SIZE_U32 unsigned */
 static size_t

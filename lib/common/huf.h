@@ -214,6 +214,13 @@ typedef enum {
    HUF_repeat_check, /**< Can use the previous table but it must be checked. Note : The previous table must have been constructed by HUF_compress{1, 4}X_repeat */
    HUF_repeat_valid  /**< Can use the previous table and it is assumed to be valid */
  } HUF_repeat;
+
+size_t HUF_ephraim (void* dst, size_t dstSize,
+                    const void* src, size_t srcSize,
+                    unsigned maxSymbolValue, unsigned huffLog,
+                    void* workSpace, size_t wkspSize,
+                    HUF_CElt* oldHufTable, HUF_repeat* repeat, int preferRepeat);
+
 /** HUF_compress4X_repeat() :
  *  Same as HUF_compress4X_wksp(), but considers using hufTable if *repeat != HUF_repeat_none.
  *  If it uses hufTable it does not modify hufTable or repeat.
