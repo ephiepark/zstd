@@ -2742,6 +2742,10 @@ void ZSTD_resetSeqStore(seqStore_t* ssPtr)
     ssPtr->longLengthID = 0;
 }
 
+static size_t ZSTD_compressSuperBlock() {
+  return 0;
+}
+
 static size_t ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
                                         void* dst, size_t dstCapacity,
                                         const void* src, size_t srcSize)
@@ -2898,9 +2902,12 @@ static size_t ZSTD_compress_frameChunk (ZSTD_CCtx* cctx,
         /* Ensure hash/chain table insertion resumes no sooner than lowlimit */
         if (ms->nextToUpdate < ms->window.lowLimit) ms->nextToUpdate = ms->window.lowLimit;
 
-        {   size_t cSize = ZSTD_compressBlock_internal(cctx,
-                                op+ZSTD_blockHeaderSize, dstCapacity-ZSTD_blockHeaderSize,
-                                ip, blockSize);
+        {   int limitMaxCBlockSize = ZSTD_limitMaxCBlockSize(&cctx->appliedParams);
+            size_t cSize = limitMaxCBlockSize ?
+                           ZSTD_compressSuperBlock() :
+                           ZSTD_compressBlock_internal(cctx,
+                                                       op+ZSTD_blockHeaderSize, dstCapacity-ZSTD_blockHeaderSize,
+                                                       ip, blockSize);
             FORWARD_IF_ERROR(cSize);
 
             if (cSize == 0) {  /* block is not compressible */
