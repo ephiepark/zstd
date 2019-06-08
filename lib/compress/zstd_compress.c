@@ -2478,6 +2478,16 @@ static int ZSTD_disableLiteralsCompression(const ZSTD_CCtx_params* cctxParams)
     }
 }
 
+static int ZSTD_limitMaxCBlockSize(const ZSTD_CCtx_params* cctxParams)
+{
+    switch (cctxParams->maxCBlockSize) {
+    case 0:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
 /* ZSTD_compressSequences_internal():
  * actually compresses both literals and sequences */
 MEM_STATIC size_t
