@@ -2818,10 +2818,6 @@ static size_t ZSTD_buildSeqStore(ZSTD_CCtx* zc, const void* src, size_t srcSize)
     return ZSTDbss_compress;
 }
 
-static size_t ZSTD_compressSuperBlock() {
-  return 0;
-}
-
 static size_t ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
                                         void* dst, size_t dstCapacity,
                                         const void* src, size_t srcSize)
@@ -2859,6 +2855,12 @@ out:
         zc->blockState.prevCBlock->entropy.fse.offcode_repeatMode = FSE_repeat_check;
 
     return cSize;
+}
+
+static size_t ZSTD_compressSuperBlock(ZSTD_CCtx* zc,
+                                    void* dst, size_t dstCapacity,
+                                    const void* src, size_t srcSize) {
+  return ZSTD_compressBlock_internal(zc, dst, dstCapacity, src, srcSize);
 }
 
 
@@ -2915,7 +2917,9 @@ static size_t ZSTD_compress_frameChunk (ZSTD_CCtx* cctx,
 
         {   int limitMaxCBlockSize = ZSTD_limitMaxCBlockSize(&cctx->appliedParams);
             size_t cSize = limitMaxCBlockSize ?
-                           ZSTD_compressSuperBlock() :
+                           ZSTD_compressSuperBlock(cctx,
+                                                   op+ZSTD_blockHeaderSize, dstCapacity-ZSTD_blockHeaderSize,
+                                                   ip, blockSize) :
                            ZSTD_compressBlock_internal(cctx,
                                                        op+ZSTD_blockHeaderSize, dstCapacity-ZSTD_blockHeaderSize,
                                                        ip, blockSize);
