@@ -2742,18 +2742,11 @@ void ZSTD_resetSeqStore(seqStore_t* ssPtr)
     ssPtr->longLengthID = 0;
 }
 
-static size_t ZSTD_compressSuperBlock() {
-  return 0;
-}
+typedef enum { ZSTDbss_compress, ZSTDbss_noCompress } ZSTD_buildSeqStore_e;
 
-static size_t ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
-                                        void* dst, size_t dstCapacity,
-                                        const void* src, size_t srcSize)
+static size_t ZSTD_buildSeqStore(ZSTD_CCtx* zc, const void* src, size_t srcSize)
 {
     ZSTD_matchState_t* const ms = &zc->blockState.matchState;
-    size_t cSize;
-    DEBUGLOG(5, "ZSTD_compressBlock_internal (dstCapacity=%u, dictLimit=%u, nextToUpdate=%u)",
-                (unsigned)dstCapacity, (unsigned)ms->window.dictLimit, (unsigned)ms->nextToUpdate);
     assert(srcSize <= ZSTD_BLOCKSIZE_MAX);
 
     /* Assert that we have correctly flushed the ctx params into the ms's copy */
@@ -2761,8 +2754,7 @@ static size_t ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
 
     if (srcSize < MIN_CBLOCK_SIZE+ZSTD_blockHeaderSize+1) {
         ZSTD_ldm_skipSequences(&zc->externSeqStore, srcSize, zc->appliedParams.cParams.minMatch);
-        cSize = 0;
-        goto out;  /* don't even attempt compression below a certain srcSize */
+        return ZSTDbss_noCompress; /* don't even attempt compression below a certain srcSize */
     }
     ZSTD_resetSeqStore(&(zc->seqStore));
     /* required for optimal parser to read stats from dictionary */
@@ -2823,6 +2815,25 @@ static size_t ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
         {   const BYTE* const lastLiterals = (const BYTE*)src + srcSize - lastLLSize;
             ZSTD_storeLastLiterals(&zc->seqStore, lastLiterals, lastLLSize);
     }   }
+    return ZSTDbss_compress;
+}
+
+static size_t ZSTD_compressSuperBlock() {
+  return 0;
+}
+
+static size_t ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
+                                        void* dst, size_t dstCapacity,
+                                        const void* src, size_t srcSize)
+{
+    size_t bss;
+    size_t cSize;
+    DEBUGLOG(5, "ZSTD_compressBlock_internal (dstCapacity=%u, dictLimit=%u, nextToUpdate=%u)",
+                (unsigned)dstCapacity, (unsigned)zc->blockState.matchState.window.dictLimit, (unsigned)zc->blockState.matchState.nextToUpdate);
+
+    bss = ZSTD_buildSeqStore(zc, src, srcSize);
+    FORWARD_IF_ERROR(bss);
+    if (bss == ZSTDbss_noCompress) { cSize = 0; goto out; }
 
     /* encode sequences and literals */
     cSize = ZSTD_compressSequences(&zc->seqStore,
