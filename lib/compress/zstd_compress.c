@@ -2652,6 +2652,33 @@ ZSTD_compressSequences_internal(seqStore_t* seqStorePtr,
     return op - ostart;
 }
 
+MEM_STATIC size_t ZSTD_buildEntropy_literal(const void* src, size_t srcSize,
+                                            unsigned maxSymbolValue, unsigned huffLog,
+                                            HUF_CElt* hufTable, size_t hufTableSize)
+{
+    unsigned count[HUF_SYMBOLVALUE_MAX + 1];
+
+    /* Scan input and build symbol stats */
+    FORWARD_IF_ERROR(HIST_count(count, &maxSymbolValue, (const BYTE*)src, srcSize) );
+
+    /* Build Huffman Tree */
+    memset(hufTable, 0, hufTableSize);
+    huffLog = HUF_optimalTableLog(huffLog, srcSize, maxSymbolValue);
+    FORWARD_IF_ERROR(HUF_buildCTable(hufTable, count, maxSymbolValue, huffLog));
+    return 0;
+}
+
+MEM_STATIC size_t
+ZSTD_buildEntropy(seqStore_t* seqStorePtr,
+                  ZSTD_entropyCTables_t* nextEntropy)
+{
+    const BYTE* const literals = seqStorePtr->litStart;
+    size_t const litSize = seqStorePtr->lit - literals;
+    FORWARD_IF_ERROR(ZSTD_buildEntropy_literal(literals, litSize, 255, 11,
+                                  (HUF_CElt*)nextEntropy->huf.CTable, sizeof(nextEntropy->huf.CTable)));
+    return 0;
+}
+
 MEM_STATIC size_t
 ZSTD_compressSequences(seqStore_t* seqStorePtr,
                        const ZSTD_entropyCTables_t* prevEntropy,
@@ -2868,6 +2895,9 @@ static size_t ZSTD_compressSuperBlock(ZSTD_CCtx* zc,
     bss = ZSTD_buildSeqStore(zc, src, srcSize);
     FORWARD_IF_ERROR(bss);
     if (bss == ZSTDbss_noCompress) { cSize = 0; goto out; }
+
+    ZSTD_buildEntropy(&zc->seqStore,
+            &zc->blockState.nextCBlock->entropy);
 
     /* encode sequences and literals */
     cSize = ZSTD_compressSequences(&zc->seqStore,
