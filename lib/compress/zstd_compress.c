@@ -2668,6 +2668,75 @@ MEM_STATIC size_t ZSTD_buildEntropy_literal(const void* src, size_t srcSize,
     return 0;
 }
 
+MEM_STATIC size_t ZSTD_buildEntropy_sequences(seqStore_t* seqStorePtr,
+                                              ZSTD_fseCTables_t* fseTables)
+{
+    unsigned count[MaxSeq+1];
+    FSE_CTable* CTable_LitLength = fseTables->litlengthCTable;
+    FSE_CTable* CTable_OffsetBits = fseTables->offcodeCTable;
+    FSE_CTable* CTable_MatchLength = fseTables->matchlengthCTable;
+    U32 LLtype, Offtype, MLtype;   /* compressed, raw or rle */
+    const BYTE* const ofCodeTable = seqStorePtr->ofCode;
+    const BYTE* const llCodeTable = seqStorePtr->llCode;
+    const BYTE* const mlCodeTable = seqStorePtr->mlCode;
+    size_t const nbSeq = seqStorePtr->sequences - seqStorePtr->sequencesStart;
+
+    /* convert length/distances into codes */
+    ZSTD_seqToCodes(seqStorePtr);
+    /* build CTable for Literal Lengths */
+    {   unsigned max = MaxLL;
+        HIST_countFast(count, &max, llCodeTable, nbSeq);   /* can't fail */
+        DEBUGLOG(5, "Building LL table");
+        LLtype = set_compressed;
+        {   S16 norm[MaxSeq + 1];
+            size_t nbSeq_1 = nbSeq;
+            const U32 tableLog = FSE_optimalTableLog(LLFSELog, nbSeq, max);
+            if (count[llCodeTable[nbSeq-1]] > 1) {
+                count[llCodeTable[nbSeq-1]]--;
+                nbSeq_1--;
+            }
+            assert(nbSeq_1 > 1);
+            FORWARD_IF_ERROR(FSE_normalizeCount(norm, tableLog, count, nbSeq_1, max));
+            FORWARD_IF_ERROR(FSE_buildCTable(CTable_LitLength, norm, max, tableLog));
+        }
+    }
+    /* build CTable for Offsets */
+    {   unsigned max = MaxOff;
+        HIST_countFast(count, &max, ofCodeTable, nbSeq);  /* can't fail */
+        DEBUGLOG(5, "Building OF table");
+        Offtype = set_compressed;
+        {   S16 norm[MaxSeq + 1];
+            size_t nbSeq_1 = nbSeq;
+            const U32 tableLog = FSE_optimalTableLog(OffFSELog, nbSeq, max);
+            if (count[ofCodeTable[nbSeq-1]] > 1) {
+                count[ofCodeTable[nbSeq-1]]--;
+                nbSeq_1--;
+            }
+            assert(nbSeq_1 > 1);
+            FORWARD_IF_ERROR(FSE_normalizeCount(norm, tableLog, count, nbSeq_1, max));
+            FORWARD_IF_ERROR(FSE_buildCTable(CTable_OffsetBits, norm, max, tableLog));
+        }
+    }
+    /* build CTable for MatchLengths */
+    {   unsigned max = MaxML;
+        HIST_countFast(count, &max, mlCodeTable, nbSeq);   /* can't fail */
+        DEBUGLOG(5, "Building ML table");
+        MLtype = set_compressed;
+        {   S16 norm[MaxSeq + 1];
+            size_t nbSeq_1 = nbSeq;
+            const U32 tableLog = FSE_optimalTableLog(MLFSELog, nbSeq, max);
+            if (count[mlCodeTable[nbSeq-1]] > 1) {
+                count[mlCodeTable[nbSeq-1]]--;
+                nbSeq_1--;
+            }
+            assert(nbSeq_1 > 1);
+            FORWARD_IF_ERROR(FSE_normalizeCount(norm, tableLog, count, nbSeq_1, max));
+            FORWARD_IF_ERROR(FSE_buildCTable(CTable_MatchLength, norm, max, tableLog));
+        }
+    }
+    return 0;
+}
+
 MEM_STATIC size_t
 ZSTD_buildEntropy(seqStore_t* seqStorePtr,
                   ZSTD_entropyCTables_t* nextEntropy)
@@ -2676,6 +2745,7 @@ ZSTD_buildEntropy(seqStore_t* seqStorePtr,
     size_t const litSize = seqStorePtr->lit - literals;
     FORWARD_IF_ERROR(ZSTD_buildEntropy_literal(literals, litSize, 255, 11,
                                   (HUF_CElt*)nextEntropy->huf.CTable, sizeof(nextEntropy->huf.CTable)));
+    FORWARD_IF_ERROR(ZSTD_buildEntropy_sequences(seqStorePtr, &nextEntropy->fse));
     return 0;
 }
 
