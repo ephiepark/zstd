@@ -2653,18 +2653,18 @@ ZSTD_compressSequences_internal(seqStore_t* seqStorePtr,
 }
 
 MEM_STATIC size_t ZSTD_buildEntropy_literal(const void* src, size_t srcSize,
-                                            unsigned maxSymbolValue, unsigned huffLog,
+                                            unsigned* maxSymbolValue, unsigned* huffLog,
                                             HUF_CElt* hufTable, size_t hufTableSize)
 {
     unsigned count[HUF_SYMBOLVALUE_MAX + 1];
 
     /* Scan input and build symbol stats */
-    FORWARD_IF_ERROR(HIST_count(count, &maxSymbolValue, (const BYTE*)src, srcSize) );
+    FORWARD_IF_ERROR(HIST_count(count, maxSymbolValue, (const BYTE*)src, srcSize) );
 
     /* Build Huffman Tree */
     memset(hufTable, 0, hufTableSize);
-    huffLog = HUF_optimalTableLog(huffLog, srcSize, maxSymbolValue);
-    FORWARD_IF_ERROR(HUF_buildCTable(hufTable, count, maxSymbolValue, huffLog));
+    *huffLog = HUF_optimalTableLog(*huffLog, srcSize, *maxSymbolValue);
+    FORWARD_IF_ERROR(HUF_buildCTable(hufTable, count, *maxSymbolValue, *huffLog));
     return 0;
 }
 
@@ -2739,11 +2739,12 @@ MEM_STATIC size_t ZSTD_buildEntropy_sequences(seqStore_t* seqStorePtr,
 
 MEM_STATIC size_t
 ZSTD_buildEntropy(seqStore_t* seqStorePtr,
-                  ZSTD_entropyCTables_t* nextEntropy)
+                  ZSTD_entropyCTables_t* nextEntropy,
+                  unsigned* maxSymbolValue, unsigned* huffLog)
 {
     const BYTE* const literals = seqStorePtr->litStart;
     size_t const litSize = seqStorePtr->lit - literals;
-    FORWARD_IF_ERROR(ZSTD_buildEntropy_literal(literals, litSize, 255, 11,
+    FORWARD_IF_ERROR(ZSTD_buildEntropy_literal(literals, litSize, maxSymbolValue, huffLog,
                                   (HUF_CElt*)nextEntropy->huf.CTable, sizeof(nextEntropy->huf.CTable)));
     FORWARD_IF_ERROR(ZSTD_buildEntropy_sequences(seqStorePtr, &nextEntropy->fse));
     return 0;
@@ -2954,9 +2955,156 @@ out:
     return cSize;
 }
 
+static size_t ZSTD_compressSubBlock_literal(const HUF_CElt* hufTable,
+                                    unsigned maxSymbolValue, unsigned huffLog,
+                                    const BYTE* literals, size_t litSize,
+                                    void* dst, size_t dstSize,
+                                    const int bmi2, int writeEntropy)
+{
+    (void)bmi2; // TODO bmi2...
+    // TODO what if compressed size is greater than litSize
+    // and litSize == 1022 and compressed size > 1024. lhSize will be wrong...
+    size_t const lhSize = 3 + (litSize >= 1 KB) + (litSize >= 16 KB);
+    BYTE* const ostart = (BYTE*)dst;
+    BYTE* const oend = ostart + dstSize;
+    BYTE* op = ostart + lhSize;
+    U32 singleStream = litSize < 256;
+    symbolEncodingType_e hType = writeEntropy ? set_compressed : set_repeat;
+    size_t cLitSize;
+
+    if (lhSize == 3) singleStream = 1;
+    if (writeEntropy) {
+        size_t hSize = HUF_writeCTable (op, dstSize, hufTable, maxSymbolValue, huffLog);
+        FORWARD_IF_ERROR(hSize);
+        op += hSize;
+    }
+
+    // TODO bmi2
+    cLitSize = singleStream ? HUF_compress1X_usingCTable(op, oend-op, literals, litSize, hufTable)
+                            : HUF_compress4X_usingCTable(op, oend-op, literals, litSize, hufTable);
+    FORWARD_IF_ERROR(cLitSize);
+    op += cLitSize;
+
+    // if (oend-op-lhSize > litSize) raw literal would be better
+
+    /* Build header */
+    switch(lhSize)
+    {
+    case 3: /* 2 - 2 - 10 - 10 */
+        {   U32 const lhc = hType + ((!singleStream) << 2) + ((U32)litSize<<4) + ((U32)cLitSize<<14);
+            MEM_writeLE24(ostart, lhc);
+            break;
+        }
+    case 4: /* 2 - 2 - 14 - 14 */
+        {   U32 const lhc = hType + (2 << 2) + ((U32)litSize<<4) + ((U32)cLitSize<<18);
+            MEM_writeLE32(ostart, lhc);
+            break;
+        }
+    case 5: /* 2 - 2 - 18 - 18 */
+        {   U32 const lhc = hType + (3 << 2) + ((U32)litSize<<4) + ((U32)cLitSize<<22);
+            MEM_writeLE32(ostart, lhc);
+            ostart[4] = (BYTE)(cLitSize >> 10);
+            break;
+        }
+    default:  /* not possible : lhSize is {3,4,5} */
+        assert(0);
+    }
+    return op-ostart;
+}
+
+static size_t ZSTD_seqDecompressedSize(const seqDef* sequences, size_t nbSeq) {
+    const seqDef* const sstart = sequences;
+    const seqDef* const send = sequences + nbSeq;
+    const seqDef* sp = sstart;
+    size_t decompressedSize = 0;
+    while (send-sp > 0) {
+      decompressedSize += sp->litLength + sp->matchLength;
+      sp++;
+    }
+    return decompressedSize;
+}
+
+static size_t ZSTD_compressSubBlock(const ZSTD_entropyCTables_t* entropy,
+                                    unsigned maxSymbolValue, unsigned huffLog,
+                                    const seqDef* sequences, size_t nbSeq,
+                                    const BYTE* literals, size_t litSize,
+                                    void* dst, size_t dstCapacity,
+                                    const int bmi2, int writeEntropy)
+{
+    BYTE* const ostart = (BYTE*)dst;
+    BYTE* const oend = ostart + dstCapacity;
+    BYTE* op = ostart + ZSTD_blockHeaderSize;
+    size_t decompressedSize = ZSTD_seqDecompressedSize(sequences, nbSeq);
+    {   size_t cLitSize = ZSTD_compressSubBlock_literal((const HUF_CElt*)entropy->huf.CTable,
+                                                        maxSymbolValue, huffLog, literals, litSize,
+                                                        op, oend-op, bmi2, writeEntropy);
+        FORWARD_IF_ERROR(cLitSize);
+        op += cLitSize;
+    }
+    {   size_t cSize = op-ostart;
+        if (decompressedSize < cSize) return 0;
+    }
+    return op-ostart;
+}
+
+static size_t ZSTD_compressSubBlocks(const seqStore_t* seqStorePtr,
+                            const ZSTD_entropyCTables_t* entropy,
+                            unsigned maxSymbolValue, unsigned huffLog,
+                            const ZSTD_CCtx_params* cctxParams,
+                                  void* dst, size_t dstCapacity,
+                            const int bmi2)
+{
+    const seqDef* const sstart = seqStorePtr->sequencesStart;
+    const seqDef* const send = seqStorePtr->sequences;
+    const seqDef* sp = sstart;
+    BYTE* lp = seqStorePtr->litStart;
+    BYTE* const lend = seqStorePtr->lit;
+    BYTE* const ostart = (BYTE*)dst;
+    BYTE* const oend = ostart + dstCapacity;
+    BYTE* op = ostart;
+    size_t maxCBlockSize = cctxParams->maxCBlockSize;
+    size_t litSize, seqSize, seqCount;
+
+    litSize = 0;
+    seqSize = 0;
+    seqCount = 0;
+    while (send - sp > 0) {
+      // TODO this is crude estimate for now...
+      // Ask Yann, Nick for feedback.
+      if (litSize + seqSize + sp->litLength + sizeof(seqDef) > maxCBlockSize) {
+          size_t cSize = ZSTD_compressSubBlock(entropy, maxSymbolValue, huffLog,
+                                               sp - seqCount, seqCount,
+                                               lp, litSize, op, oend-op,
+                                               bmi2, sstart==(sp - seqCount));
+          FORWARD_IF_ERROR(cSize);
+          // if cSize == 0 failed to compress.
+          litSize = 0;
+          seqSize = 0;
+          seqCount = 0;
+          lp += litSize;
+          op += cSize;
+      }
+      litSize += sp->litLength;
+      seqSize += sizeof(seqDef);
+      seqCount++;
+      sp++;
+    }
+    {   size_t cSize = ZSTD_compressSubBlock(entropy, maxSymbolValue, huffLog,
+                                             sp - seqCount, seqCount,
+                                             lp, lend-lp, op, oend-op,
+                                             bmi2, sstart==(sp - seqCount));
+        FORWARD_IF_ERROR(cSize);
+        op += cSize;
+    }
+
+    return op-ostart;
+}
+
 static size_t ZSTD_compressSuperBlock(ZSTD_CCtx* zc,
                                     void* dst, size_t dstCapacity,
                                     const void* src, size_t srcSize) {
+    unsigned maxSymbolValue = 255;
+    unsigned huffLog = 11;
     size_t bss;
     size_t cSize;
     DEBUGLOG(5, "ZSTD_compressSuperBlock (dstCapacity=%u, dictLimit=%u, nextToUpdate=%u)",
@@ -2966,16 +3114,14 @@ static size_t ZSTD_compressSuperBlock(ZSTD_CCtx* zc,
     FORWARD_IF_ERROR(bss);
     if (bss == ZSTDbss_noCompress) { cSize = 0; goto out; }
 
-    ZSTD_buildEntropy(&zc->seqStore,
-            &zc->blockState.nextCBlock->entropy);
+    FORWARD_IF_ERROR(ZSTD_buildEntropy(&zc->seqStore,
+            &zc->blockState.nextCBlock->entropy, &maxSymbolValue, &huffLog));
 
-    /* encode sequences and literals */
-    cSize = ZSTD_compressSequences(&zc->seqStore,
-            &zc->blockState.prevCBlock->entropy, &zc->blockState.nextCBlock->entropy,
+    cSize = ZSTD_compressSubBlocks(&zc->seqStore,
+            &zc->blockState.nextCBlock->entropy,
+            maxSymbolValue, huffLog,
             &zc->appliedParams,
             dst, dstCapacity,
-            srcSize,
-            zc->entropyWorkspace, HUF_WORKSPACE_SIZE /* statically allocated in resetCCtx */,
             zc->bmi2);
 
 out:
