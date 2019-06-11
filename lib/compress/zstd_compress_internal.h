@@ -82,6 +82,25 @@ typedef struct {
 } ZSTD_entropyCTables_t;
 
 typedef struct {
+    unsigned maxSymbolValue;
+    unsigned huffLog;
+} ZSTD_hufCTablesMetadata_t;
+
+typedef struct {
+    S16 llNorm[MaxLL+1];
+    S16 ofNorm[MaxOff+1];
+    S16 mlNorm[MaxML+1];
+    unsigned llTableLog;
+    unsigned ofTableLog;
+    unsigned mlTableLog;
+} ZSTD_fseCTablesMetadata_t;
+
+typedef struct {
+    ZSTD_hufCTablesMetadata_t hufMetadata;
+    ZSTD_fseCTablesMetadata_t fseMetadata;
+} ZSTD_entropyCTablesMetadata_t;
+
+typedef struct {
     U32 off;
     U32 len;
 } ZSTD_match_t;
