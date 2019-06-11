@@ -3119,7 +3119,7 @@ static size_t ZSTD_compressSubBlock(const ZSTD_entropyCTables_t* entropy,
                                     const BYTE* llCode, const BYTE* mlCode, const BYTE* ofCode,
                                     const ZSTD_CCtx_params* cctxParams,
                                     void* dst, size_t dstCapacity,
-                                    const int bmi2, int writeEntropy)
+                                    const int bmi2, int writeEntropy, U32 lastBlock)
 {
     BYTE* const ostart = (BYTE*)dst;
     BYTE* const oend = ostart + dstCapacity;
@@ -3143,10 +3143,13 @@ static size_t ZSTD_compressSubBlock(const ZSTD_entropyCTables_t* entropy,
         FORWARD_IF_ERROR(cSeqSize);
         op += cSeqSize;
     }
-    {   size_t cSize = op-ostart;
+    /* Write block header */
+    {   size_t cSize = (op-ostart)-ZSTD_blockHeaderSize;
+        U32 const cBlockHeader24 = lastBlock + (((U32)bt_compressed)<<1) + (U32)(cSize << 3);
         DEBUGLOG(5, "ZSTD_compressSubBlock (decompressedSize=%zu, cSize=%zu)",
-                  decompressedSize, cSize);
+                    decompressedSize, cSize);
         if (decompressedSize < cSize) return 0;
+        MEM_writeLE24(ostart, cBlockHeader24);
     }
     return op-ostart;
 }
@@ -3185,7 +3188,7 @@ static size_t ZSTD_compressSubBlocks(const seqStore_t* seqStorePtr,
                                                seqStorePtr->llCode, seqStorePtr->mlCode, seqStorePtr->ofCode,
                                                cctxParams,
                                                op, oend-op,
-                                               bmi2, sstart==(sp - seqCount));
+                                               bmi2, sstart==(sp - seqCount), 0);
           FORWARD_IF_ERROR(cSize);
           // if cSize == 0 failed to compress.
           litSize = 0;
@@ -3205,7 +3208,7 @@ static size_t ZSTD_compressSubBlocks(const seqStore_t* seqStorePtr,
                                              seqStorePtr->llCode, seqStorePtr->mlCode, seqStorePtr->ofCode,
                                              cctxParams,
                                              op, oend-op,
-                                             bmi2, sstart==(sp - seqCount));
+                                             bmi2, sstart==(sp - seqCount), 1);
         FORWARD_IF_ERROR(cSize);
         op += cSize;
     }
@@ -3308,23 +3311,26 @@ static size_t ZSTD_compress_frameChunk (ZSTD_CCtx* cctx,
         if (ms->nextToUpdate < ms->window.lowLimit) ms->nextToUpdate = ms->window.lowLimit;
 
         {   int limitMaxCBlockSize = ZSTD_limitMaxCBlockSize(&cctx->appliedParams);
-            size_t cSize = limitMaxCBlockSize ?
-                           ZSTD_compressSuperBlock(cctx,
-                                                   op+ZSTD_blockHeaderSize, dstCapacity-ZSTD_blockHeaderSize,
-                                                   ip, blockSize) :
-                           ZSTD_compressBlock_internal(cctx,
-                                                       op+ZSTD_blockHeaderSize, dstCapacity-ZSTD_blockHeaderSize,
-                                                       ip, blockSize);
-            FORWARD_IF_ERROR(cSize);
-
-            if (cSize == 0) {  /* block is not compressible */
-                cSize = ZSTD_noCompressBlock(op, dstCapacity, ip, blockSize, lastBlock);
+            size_t cSize;
+            if (limitMaxCBlockSize) {
+                cSize = ZSTD_compressSuperBlock(cctx, op, dstCapacity, ip, blockSize);
                 FORWARD_IF_ERROR(cSize);
             } else {
-                U32 const cBlockHeader24 = lastBlock + (((U32)bt_compressed)<<1) + (U32)(cSize << 3);
-                MEM_writeLE24(op, cBlockHeader24);
-                cSize += ZSTD_blockHeaderSize;
+                cSize = ZSTD_compressBlock_internal(cctx,
+                                        op+ZSTD_blockHeaderSize, dstCapacity-ZSTD_blockHeaderSize,
+                                        ip, blockSize);
+                FORWARD_IF_ERROR(cSize);
+
+                if (cSize == 0) {  /* block is not compressible */
+                    cSize = ZSTD_noCompressBlock(op, dstCapacity, ip, blockSize, lastBlock);
+                    FORWARD_IF_ERROR(cSize);
+                } else {
+                    U32 const cBlockHeader24 = lastBlock + (((U32)bt_compressed)<<1) + (U32)(cSize << 3);
+                    MEM_writeLE24(op, cBlockHeader24);
+                    cSize += ZSTD_blockHeaderSize;
+                }
             }
+
 
             ip += blockSize;
             assert(remaining >= blockSize);
