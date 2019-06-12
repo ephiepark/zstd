@@ -3158,6 +3158,7 @@ static size_t ZSTD_compressSubBlocks(const seqStore_t* seqStorePtr,
                             const ZSTD_entropyCTablesMetadata_t* entropyMetadata,
                             const ZSTD_CCtx_params* cctxParams,
                                   void* dst, size_t dstCapacity,
+                            const void* src, size_t srcSize,
                             const int bmi2, U32 lastBlock)
 {
     const seqDef* const sstart = seqStorePtr->sequencesStart;
@@ -3168,11 +3169,14 @@ static size_t ZSTD_compressSubBlocks(const seqStore_t* seqStorePtr,
     BYTE* const ostart = (BYTE*)dst;
     BYTE* const oend = ostart + dstCapacity;
     BYTE* op = ostart;
+    const BYTE* ip = (const BYTE*)src;
+    const BYTE* const iend = (const BYTE*)src + srcSize;
     const BYTE* llCodePtr = seqStorePtr->llCode;
     const BYTE* mlCodePtr = seqStorePtr->mlCode;
     const BYTE* ofCodePtr = seqStorePtr->ofCode;
     size_t maxCBlockSize = cctxParams->maxCBlockSize;
     size_t litSize, seqSize, seqCount;
+    int writeEntropy = 1;
 
     DEBUGLOG(5, "ZSTD_compressSubBlocks (litSize=%u, nbSeq=%u)",
                 (unsigned)(lend-lp), (unsigned)(send-sstart));
@@ -3184,18 +3188,24 @@ static size_t ZSTD_compressSubBlocks(const seqStore_t* seqStorePtr,
       // TODO this is crude estimate for now...
       // Ask Yann, Nick for feedback.
       if (litSize + seqSize + sp->litLength + sizeof(seqDef) > maxCBlockSize) {
+          size_t decompressedSize = ZSTD_seqDecompressedSize(sp - seqCount, seqCount, litSize);
           size_t cSize = ZSTD_compressSubBlock(entropy, entropyMetadata,
                                                sp - seqCount, seqCount,
                                                lp, litSize,
                                                llCodePtr, mlCodePtr, ofCodePtr,
                                                cctxParams,
                                                op, oend-op,
-                                               bmi2, sstart==(sp - seqCount), 0);
+                                               bmi2, writeEntropy, 0);
           FORWARD_IF_ERROR(cSize);
+          if (cSize > 0 && writeEntropy) writeEntropy = 0; // Entropy only needs to be written once
+          else if (cSize == 0) {
+            cSize = ZSTD_noCompressBlock(op, oend-op, ip, decompressedSize, 0);
+            FORWARD_IF_ERROR(cSize);
+          }
           DEBUGLOG(5, "ZSTD_compressSubBlocks (subBlockCSize=%zu)", cSize);
-          // if cSize == 0 failed to compress.
           lp += litSize;
           op += cSize;
+          ip += decompressedSize;
           llCodePtr += seqCount;
           mlCodePtr += seqCount;
           ofCodePtr += seqCount;
@@ -3208,18 +3218,25 @@ static size_t ZSTD_compressSubBlocks(const seqStore_t* seqStorePtr,
       seqCount++;
       sp++;
     }
-    {   size_t cSize = ZSTD_compressSubBlock(entropy, entropyMetadata,
+    {   size_t decompressedSize = ZSTD_seqDecompressedSize(sp - seqCount, seqCount, lend-lp);
+        size_t cSize = ZSTD_compressSubBlock(entropy, entropyMetadata,
                                              sp - seqCount, seqCount,
                                              lp, lend-lp,
                                              llCodePtr, mlCodePtr, ofCodePtr,
                                              cctxParams,
                                              op, oend-op,
-                                             bmi2, sstart==(sp - seqCount), lastBlock);
+                                             bmi2, writeEntropy, lastBlock);
         FORWARD_IF_ERROR(cSize);
+        if (cSize == 0) {
+          cSize = ZSTD_noCompressBlock(op, oend-op, ip, decompressedSize, lastBlock);
+          FORWARD_IF_ERROR(cSize);
+        }
         DEBUGLOG(5, "ZSTD_compressSubBlocks (subBlockCSize=%zu)", cSize);
         op += cSize;
+        ip += decompressedSize;
     }
 
+    assert(ip == iend);
     return op-ostart;
 }
 
@@ -3247,6 +3264,7 @@ static size_t ZSTD_compressSuperBlock(ZSTD_CCtx* zc,
             &entropyMetadata,
             &zc->appliedParams,
             dst, dstCapacity,
+            src, srcSize,
             zc->bmi2, lastBlock);
 
 out:
