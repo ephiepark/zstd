@@ -2478,6 +2478,10 @@ static int ZSTD_disableLiteralsCompression(const ZSTD_CCtx_params* cctxParams)
     }
 }
 
+/* ZSTD_limitMaxCBlockSize():
+ * Returns if limit max compressed block size param is being used.
+ * If it is, ZSTD block size should not exceed the limit.
+ * Returns 1 if true, 0 otherwise. */
 static int ZSTD_limitMaxCBlockSize(const ZSTD_CCtx_params* cctxParams)
 {
     switch (cctxParams->maxCBlockSize) {
