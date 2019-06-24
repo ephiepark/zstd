@@ -82,6 +82,25 @@ typedef struct {
 } ZSTD_entropyCTables_t;
 
 typedef struct {
+    symbolEncodingType_e hType;
+    BYTE hufDesBuffer[500];
+    size_t hufDesSize;
+} ZSTD_hufCTablesMetadata_t;
+
+typedef struct {
+    symbolEncodingType_e llType;
+    symbolEncodingType_e ofType;
+    symbolEncodingType_e mlType;
+    BYTE fseTablesBuffer[500];
+    size_t fseTablesSize;
+} ZSTD_fseCTablesMetadata_t;
+
+typedef struct {
+    ZSTD_hufCTablesMetadata_t hufMetadata;
+    ZSTD_fseCTablesMetadata_t fseMetadata;
+} ZSTD_entropyCTablesMetadata_t;
+
+typedef struct {
     U32 off;
     U32 len;
 } ZSTD_match_t;
@@ -194,6 +213,9 @@ struct ZSTD_CCtx_params_s {
     int compressionLevel;
     int forceWindow;           /* force back-references to respect limit of
                                 * 1<<wLog, even for dictionary */
+    size_t targetCBlockSize;   /* Tries to fit compressed block size to be around targetCBlockSize.
+                                * No target when targetCBlockSize == 0.
+                                * There is no guarantee on compressed block size */
 
     ZSTD_dictAttachPref_e attachDictPref;
     ZSTD_literalCompressionMode_e literalCompressionMode;
