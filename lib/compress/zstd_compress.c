@@ -385,7 +385,7 @@ ZSTD_bounds ZSTD_cParam_getBounds(ZSTD_cParameter param)
         bounds.upperBound = ZSTD_lcm_uncompressed;
         return bounds;
 
-    case ZSTD_c_maxCBlockSize:
+    case ZSTD_c_targetCBlockSize:
         bounds.lowerBound = 0; // TODO probably need lower bound
         bounds.upperBound = ZSTD_BLOCKSIZE_MAX;
         return bounds;
@@ -457,7 +457,7 @@ static int ZSTD_isUpdateAuthorized(ZSTD_cParameter param)
     case ZSTD_c_ldmHashRateLog:
     case ZSTD_c_forceAttachDict:
     case ZSTD_c_literalCompressionMode:
-    case ZSTD_c_maxCBlockSize:
+    case ZSTD_c_targetCBlockSize:
     default:
         return 0;
     }
@@ -503,7 +503,7 @@ size_t ZSTD_CCtx_setParameter(ZSTD_CCtx* cctx, ZSTD_cParameter param, int value)
     case ZSTD_c_ldmHashLog:
     case ZSTD_c_ldmMinMatch:
     case ZSTD_c_ldmBucketSizeLog:
-    case ZSTD_c_maxCBlockSize:
+    case ZSTD_c_targetCBlockSize:
         break;
 
     default: RETURN_ERROR(parameter_unsupported);
@@ -678,11 +678,11 @@ size_t ZSTD_CCtxParams_setParameter(ZSTD_CCtx_params* CCtxParams,
         CCtxParams->ldmParams.hashRateLog = value;
         return CCtxParams->ldmParams.hashRateLog;
 
-    case ZSTD_c_maxCBlockSize :
+    case ZSTD_c_targetCBlockSize :
         if (value!=0)   /* 0 ==> default */
-            BOUNDCHECK(ZSTD_c_maxCBlockSize, value);
-        CCtxParams->maxCBlockSize = value;
-        return CCtxParams->maxCBlockSize;
+            BOUNDCHECK(ZSTD_c_targetCBlockSize, value);
+        CCtxParams->targetCBlockSize = value;
+        return CCtxParams->targetCBlockSize;
 
     default: RETURN_ERROR(parameter_unsupported, "unknown parameter");
     }
@@ -786,8 +786,8 @@ size_t ZSTD_CCtxParams_getParameter(
     case ZSTD_c_ldmHashRateLog :
         *value = CCtxParams->ldmParams.hashRateLog;
         break;
-    case ZSTD_c_maxCBlockSize :
-        *value = CCtxParams->maxCBlockSize;
+    case ZSTD_c_targetCBlockSize :
+        *value = CCtxParams->targetCBlockSize;
         break;
     default: RETURN_ERROR(parameter_unsupported, "unknown parameter");
     }
@@ -2039,7 +2039,6 @@ void ZSTD_seqToCodes(const seqStore_t* seqStorePtr)
     U32 u;
     assert(nbSeq <= seqStorePtr->maxNbSeq);
     for (u=0; u<nbSeq; u++) {
-        // DEBUGLOG(5, "sequences i=%d, ll, ml, of: %d, %d, %d", u, sequences[u].litLength, sequences[u].matchLength, sequences[u].offset);
         U32 const llv = sequences[u].litLength;
         U32 const mlv = sequences[u].matchLength;
         llCodeTable[u] = (BYTE)ZSTD_LLcode(llv);
@@ -2193,7 +2192,6 @@ ZSTD_selectEncodingType(
         ZSTD_defaultPolicy_e const isDefaultAllowed,
         ZSTD_strategy const strategy)
 {
-    DEBUGLOG(5, "strategy %d, mostFrequent %zu, nbSeq %zu", (int)strategy, mostFrequent, nbSeq);
     ZSTD_STATIC_ASSERT(ZSTD_defaultDisallowed == 0 && ZSTD_defaultAllowed != 0);
     if (mostFrequent == nbSeq) {
         *repeatMode = FSE_repeat_none;
@@ -2480,14 +2478,14 @@ static int ZSTD_disableLiteralsCompression(const ZSTD_CCtx_params* cctxParams)
     }
 }
 
-/* ZSTD_limitMaxCBlockSize():
- * Returns if limit max compressed block size param is being used.
- * If it is, ZSTD block size should not exceed the limit.
+/* ZSTD_useTargetCBlockSize():
+ * Returns if target compressed block size param is being used.
+ * If used, compression will do best effort to make a compressed block size to be around targetCBlockSize.
  * Returns 1 if true, 0 otherwise. */
-static int ZSTD_limitMaxCBlockSize(const ZSTD_CCtx_params* cctxParams)
+static int ZSTD_useTargetCBlockSize(const ZSTD_CCtx_params* cctxParams)
 {
-    DEBUGLOG(5, "ZSTD_limitMaxCBlockSize (maxCBlockSize=%d)", cctxParams->maxCBlockSize);
-    switch (cctxParams->maxCBlockSize) {
+    DEBUGLOG(5, "ZSTD_useTargetCBlockSize (targetCBlockSize=%d)", cctxParams->targetCBlockSize);
+    switch (cctxParams->targetCBlockSize) {
     case 0:
         return 0;
     default:
@@ -2747,7 +2745,7 @@ MEM_STATIC size_t ZSTD_buildEntropy_sequences(seqStore_t* seqStorePtr,
             // if (LLtype == set_compressed)
             //     lastNCount = op;
             op += countSize;
-            fseMetadata->llType = LLtype;
+            fseMetadata->llType = (symbolEncodingType_e) LLtype;
     }   }
     /* build CTable for Offsets */
     {   unsigned max = MaxOff;
@@ -2770,7 +2768,7 @@ MEM_STATIC size_t ZSTD_buildEntropy_sequences(seqStore_t* seqStorePtr,
             // if (Offtype == set_compressed)
             //     lastNCount = op;
             op += countSize;
-            fseMetadata->ofType = Offtype;
+            fseMetadata->ofType = (symbolEncodingType_e) Offtype;
     }   }
     /* build CTable for MatchLengths */
     {   unsigned max = MaxML;
@@ -2791,7 +2789,7 @@ MEM_STATIC size_t ZSTD_buildEntropy_sequences(seqStore_t* seqStorePtr,
             // if (MLtype == set_compressed)
             //     lastNCount = op;
             op += countSize;
-            fseMetadata->mlType = MLtype;
+            fseMetadata->mlType = (symbolEncodingType_e) MLtype;
     }   }
     assert((size_t) (op-ostart) <= sizeof(fseMetadata->fseTablesBuffer));
     return op-ostart;
@@ -3244,7 +3242,7 @@ static size_t ZSTD_compressSubBlocks(const seqStore_t* seqStorePtr,
     const BYTE* llCodePtr = seqStorePtr->llCode;
     const BYTE* mlCodePtr = seqStorePtr->mlCode;
     const BYTE* ofCodePtr = seqStorePtr->ofCode;
-    size_t maxCBlockSize = cctxParams->maxCBlockSize;
+    size_t targetCBlockSize = cctxParams->targetCBlockSize;
     size_t litSize, seqSize, seqCount;
     int writeEntropy = 1;
 
@@ -3257,7 +3255,7 @@ static size_t ZSTD_compressSubBlocks(const seqStore_t* seqStorePtr,
     while (send - sp > 0) {
       // TODO this is crude estimate for now...
       // Ask Yann, Nick for feedback.
-      if (litSize + seqSize + sp->litLength + sizeof(seqDef) > maxCBlockSize) {
+      if (litSize + seqSize + sp->litLength + sizeof(seqDef) > targetCBlockSize) {
           size_t decompressedSize = ZSTD_seqDecompressedSize(sp - seqCount, seqCount, litSize);
           size_t cSize = ZSTD_compressSubBlock(entropy, entropyMetadata,
                                                sp - seqCount, seqCount,
@@ -3413,10 +3411,9 @@ static size_t ZSTD_compress_frameChunk (ZSTD_CCtx* cctx,
         /* Ensure hash/chain table insertion resumes no sooner than lowlimit */
         if (ms->nextToUpdate < ms->window.lowLimit) ms->nextToUpdate = ms->window.lowLimit;
 
-        {   int limitMaxCBlockSize = ZSTD_limitMaxCBlockSize(&cctx->appliedParams);
-            //limitMaxCBlockSize = 0;
+        {   int useTargetCBlockSize = ZSTD_useTargetCBlockSize(&cctx->appliedParams);
             size_t cSize;
-            if (limitMaxCBlockSize) {
+            if (useTargetCBlockSize) {
                 cSize = ZSTD_compressSuperBlock(cctx, op, dstCapacity, ip, blockSize, lastBlock);
                 FORWARD_IF_ERROR(cSize);
             } else {

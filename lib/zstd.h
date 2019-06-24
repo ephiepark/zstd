@@ -380,7 +380,7 @@ typedef enum {
      * ZSTD_c_forceMaxWindow
      * ZSTD_c_forceAttachDict
      * ZSTD_c_literalCompressionMode
-     * ZSTD_c_maxCBlockSize
+     * ZSTD_c_targetCBlockSize
      * Because they are not stable, it's necessary to define ZSTD_STATIC_LINKING_ONLY to access them.
      * note : never ever use experimentalParam? names directly;
      *        also, the enums values themselves are unstable and can still change.
@@ -1427,9 +1427,10 @@ ZSTDLIB_API size_t ZSTD_CCtx_refPrefix_advanced(ZSTD_CCtx* cctx, const void* pre
  */
 #define ZSTD_c_literalCompressionMode ZSTD_c_experimentalParam5
 
-/* Force all compressed block size to be < maxCBlockSize.
- * No limit when maxCBlockSize == 0 (default:0) */
-#define ZSTD_c_maxCBlockSize ZSTD_c_experimentalParam6
+/* Tries to fit compressed block size to be around targetCBlockSize.
+ * No target when targetCBlockSize == 0.
+ * There is no guarantee on compressed block size (default:0) */
+#define ZSTD_c_targetCBlockSize ZSTD_c_experimentalParam6
 
 /*! ZSTD_CCtx_getParameter() :
  *  Get the requested compression parameter value, selected by enum ZSTD_cParameter,

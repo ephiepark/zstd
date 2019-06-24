@@ -213,8 +213,9 @@ struct ZSTD_CCtx_params_s {
     int compressionLevel;
     int forceWindow;           /* force back-references to respect limit of
                                 * 1<<wLog, even for dictionary */
-    int maxCBlockSize;         /* force all compressed block size to be < maxCBlockSize.
-                                * No limit when maxCBlockSize == 0 */
+    size_t targetCBlockSize;   /* Tries to fit compressed block size to be around targetCBlockSize.
+                                * No target when targetCBlockSize == 0.
+                                * There is no guarantee on compressed block size */
 
     ZSTD_dictAttachPref_e attachDictPref;
     ZSTD_literalCompressionMode_e literalCompressionMode;
