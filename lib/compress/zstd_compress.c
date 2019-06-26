@@ -20,7 +20,10 @@
 #include "fse.h"
 #define HUF_STATIC_LINKING_ONLY
 #include "huf.h"
+#include "zstd_compress_advanced.h"
 #include "zstd_compress_internal.h"
+#include "zstd_compress_sequences.h"
+#include "zstd_compress_literals.h"
 #include "zstd_fast.h"
 #include "zstd_double_fast.h"
 #include "zstd_lazy.h"
@@ -385,6 +388,11 @@ ZSTD_bounds ZSTD_cParam_getBounds(ZSTD_cParameter param)
         bounds.upperBound = ZSTD_lcm_uncompressed;
         return bounds;
 
+    case ZSTD_c_targetCBlockSize:
+        bounds.lowerBound = ZSTD_TARGETCBLOCKSIZE_MIN;
+        bounds.upperBound = ZSTD_TARGETCBLOCKSIZE_MAX;
+        return bounds;
+
     default:
         {   ZSTD_bounds const boundError = { ERROR(parameter_unsupported), 0, 0 };
             return boundError;
@@ -452,6 +460,7 @@ static int ZSTD_isUpdateAuthorized(ZSTD_cParameter param)
     case ZSTD_c_ldmHashRateLog:
     case ZSTD_c_forceAttachDict:
     case ZSTD_c_literalCompressionMode:
+    case ZSTD_c_targetCBlockSize:
     default:
         return 0;
     }
@@ -497,6 +506,7 @@ size_t ZSTD_CCtx_setParameter(ZSTD_CCtx* cctx, ZSTD_cParameter param, int value)
     case ZSTD_c_ldmHashLog:
     case ZSTD_c_ldmMinMatch:
     case ZSTD_c_ldmBucketSizeLog:
+    case ZSTD_c_targetCBlockSize:
         break;
 
     default: RETURN_ERROR(parameter_unsupported);
@@ -671,6 +681,12 @@ size_t ZSTD_CCtxParams_setParameter(ZSTD_CCtx_params* CCtxParams,
         CCtxParams->ldmParams.hashRateLog = value;
         return CCtxParams->ldmParams.hashRateLog;
 
+    case ZSTD_c_targetCBlockSize :
+        if (value!=0)   /* 0 ==> default */
+            BOUNDCHECK(ZSTD_c_targetCBlockSize, value);
+        CCtxParams->targetCBlockSize = value;
+        return CCtxParams->targetCBlockSize;
+
     default: RETURN_ERROR(parameter_unsupported, "unknown parameter");
     }
 }
@@ -772,6 +788,9 @@ size_t ZSTD_CCtxParams_getParameter(
         break;
     case ZSTD_c_ldmHashRateLog :
         *value = CCtxParams->ldmParams.hashRateLog;
+        break;
+    case ZSTD_c_targetCBlockSize :
+        *value = CCtxParams->targetCBlockSize;
         break;
     default: RETURN_ERROR(parameter_unsupported, "unknown parameter");
     }
@@ -1864,59 +1883,6 @@ static size_t ZSTD_noCompressBlock (void* dst, size_t dstCapacity, const void* s
     return ZSTD_blockHeaderSize + srcSize;
 }
 
-static size_t ZSTD_noCompressLiterals (void* dst, size_t dstCapacity, const void* src, size_t srcSize)
-{
-    BYTE* const ostart = (BYTE* const)dst;
-    U32   const flSize = 1 + (srcSize>31) + (srcSize>4095);
-
-    RETURN_ERROR_IF(srcSize + flSize > dstCapacity, dstSize_tooSmall);
-
-    switch(flSize)
-    {
-        case 1: /* 2 - 1 - 5 */
-            ostart[0] = (BYTE)((U32)set_basic + (srcSize<<3));
-            break;
-        case 2: /* 2 - 2 - 12 */
-            MEM_writeLE16(ostart, (U16)((U32)set_basic + (1<<2) + (srcSize<<4)));
-            break;
-        case 3: /* 2 - 2 - 20 */
-            MEM_writeLE32(ostart, (U32)((U32)set_basic + (3<<2) + (srcSize<<4)));
-            break;
-        default:   /* not necessary : flSize is {1,2,3} */
-            assert(0);
-    }
-
-    memcpy(ostart + flSize, src, srcSize);
-    return srcSize + flSize;
-}
-
-static size_t ZSTD_compressRleLiteralsBlock (void* dst, size_t dstCapacity, const void* src, size_t srcSize)
-{
-    BYTE* const ostart = (BYTE* const)dst;
-    U32   const flSize = 1 + (srcSize>31) + (srcSize>4095);
-
-    (void)dstCapacity;  /* dstCapacity already guaranteed to be >=4, hence large enough */
-
-    switch(flSize)
-    {
-        case 1: /* 2 - 1 - 5 */
-            ostart[0] = (BYTE)((U32)set_rle + (srcSize<<3));
-            break;
-        case 2: /* 2 - 2 - 12 */
-            MEM_writeLE16(ostart, (U16)((U32)set_rle + (1<<2) + (srcSize<<4)));
-            break;
-        case 3: /* 2 - 2 - 20 */
-            MEM_writeLE32(ostart, (U32)((U32)set_rle + (3<<2) + (srcSize<<4)));
-            break;
-        default:   /* not necessary : flSize is {1,2,3} */
-            assert(0);
-    }
-
-    ostart[flSize] = *(const BYTE*)src;
-    return flSize+1;
-}
-
-
 /* ZSTD_minGain() :
  * minimum compression required
  * to generate a compress block or a compressed literals section.
@@ -2035,418 +2001,6 @@ void ZSTD_seqToCodes(const seqStore_t* seqStorePtr)
         mlCodeTable[seqStorePtr->longLengthPos] = MaxML;
 }
 
-
-/**
- * -log2(x / 256) lookup table for x in [0, 256).
- * If x == 0: Return 0
- * Else: Return floor(-log2(x / 256) * 256)
- */
-static unsigned const kInverseProbabilityLog256[256] = {
-    0,    2048, 1792, 1642, 1536, 1453, 1386, 1329, 1280, 1236, 1197, 1162,
-    1130, 1100, 1073, 1047, 1024, 1001, 980,  960,  941,  923,  906,  889,
-    874,  859,  844,  830,  817,  804,  791,  779,  768,  756,  745,  734,
-    724,  714,  704,  694,  685,  676,  667,  658,  650,  642,  633,  626,
-    618,  610,  603,  595,  588,  581,  574,  567,  561,  554,  548,  542,
-    535,  529,  523,  517,  512,  506,  500,  495,  489,  484,  478,  473,
-    468,  463,  458,  453,  448,  443,  438,  434,  429,  424,  420,  415,
-    411,  407,  402,  398,  394,  390,  386,  382,  377,  373,  370,  366,
-    362,  358,  354,  350,  347,  343,  339,  336,  332,  329,  325,  322,
-    318,  315,  311,  308,  305,  302,  298,  295,  292,  289,  286,  282,
-    279,  276,  273,  270,  267,  264,  261,  258,  256,  253,  250,  247,
-    244,  241,  239,  236,  233,  230,  228,  225,  222,  220,  217,  215,
-    212,  209,  207,  204,  202,  199,  197,  194,  192,  190,  187,  185,
-    182,  180,  178,  175,  173,  171,  168,  166,  164,  162,  159,  157,
-    155,  153,  151,  149,  146,  144,  142,  140,  138,  136,  134,  132,
-    130,  128,  126,  123,  121,  119,  117,  115,  114,  112,  110,  108,
-    106,  104,  102,  100,  98,   96,   94,   93,   91,   89,   87,   85,
-    83,   82,   80,   78,   76,   74,   73,   71,   69,   67,   66,   64,
-    62,   61,   59,   57,   55,   54,   52,   50,   49,   47,   46,   44,
-    42,   41,   39,   37,   36,   34,   33,   31,   30,   28,   26,   25,
-    23,   22,   20,   19,   17,   16,   14,   13,   11,   10,   8,    7,
-    5,    4,    2,    1,
-};
-
-
-/**
- * Returns the cost in bits of encoding the distribution described by count
- * using the entropy bound.
- */
-static size_t ZSTD_entropyCost(unsigned const* count, unsigned const max, size_t const total)
-{
-    unsigned cost = 0;
-    unsigned s;
-    for (s = 0; s <= max; ++s) {
-        unsigned norm = (unsigned)((256 * count[s]) / total);
-        if (count[s] != 0 && norm == 0)
-            norm = 1;
-        assert(count[s] < total);
-        cost += count[s] * kInverseProbabilityLog256[norm];
-    }
-    return cost >> 8;
-}
-
-
-/**
- * Returns the cost in bits of encoding the distribution in count using the
- * table described by norm. The max symbol support by norm is assumed >= max.
- * norm must be valid for every symbol with non-zero probability in count.
- */
-static size_t ZSTD_crossEntropyCost(short const* norm, unsigned accuracyLog,
-                                    unsigned const* count, unsigned const max)
-{
-    unsigned const shift = 8 - accuracyLog;
-    size_t cost = 0;
-    unsigned s;
-    assert(accuracyLog <= 8);
-    for (s = 0; s <= max; ++s) {
-        unsigned const normAcc = norm[s] != -1 ? norm[s] : 1;
-        unsigned const norm256 = normAcc << shift;
-        assert(norm256 > 0);
-        assert(norm256 < 256);
-        cost += count[s] * kInverseProbabilityLog256[norm256];
-    }
-    return cost >> 8;
-}
-
-
-static unsigned ZSTD_getFSEMaxSymbolValue(FSE_CTable const* ctable) {
-  void const* ptr = ctable;
-  U16 const* u16ptr = (U16 const*)ptr;
-  U32 const maxSymbolValue = MEM_read16(u16ptr + 1);
-  return maxSymbolValue;
-}
-
-
-/**
- * Returns the cost in bits of encoding the distribution in count using ctable.
- * Returns an error if ctable cannot represent all the symbols in count.
- */
-static size_t ZSTD_fseBitCost(
-    FSE_CTable const* ctable,
-    unsigned const* count,
-    unsigned const max)
-{
-    unsigned const kAccuracyLog = 8;
-    size_t cost = 0;
-    unsigned s;
-    FSE_CState_t cstate;
-    FSE_initCState(&cstate, ctable);
-    RETURN_ERROR_IF(ZSTD_getFSEMaxSymbolValue(ctable) < max, GENERIC,
-                    "Repeat FSE_CTable has maxSymbolValue %u < %u",
-                    ZSTD_getFSEMaxSymbolValue(ctable), max);
-    for (s = 0; s <= max; ++s) {
-        unsigned const tableLog = cstate.stateLog;
-        unsigned const badCost = (tableLog + 1) << kAccuracyLog;
-        unsigned const bitCost = FSE_bitCost(cstate.symbolTT, tableLog, s, kAccuracyLog);
-        if (count[s] == 0)
-            continue;
-        RETURN_ERROR_IF(bitCost >= badCost, GENERIC,
-                        "Repeat FSE_CTable has Prob[%u] == 0", s);
-        cost += count[s] * bitCost;
-    }
-    return cost >> kAccuracyLog;
-}
-
-/**
- * Returns the cost in bytes of encoding the normalized count header.
- * Returns an error if any of the helper functions return an error.
- */
-static size_t ZSTD_NCountCost(unsigned const* count, unsigned const max,
-                              size_t const nbSeq, unsigned const FSELog)
-{
-    BYTE wksp[FSE_NCOUNTBOUND];
-    S16 norm[MaxSeq + 1];
-    const U32 tableLog = FSE_optimalTableLog(FSELog, nbSeq, max);
-    FORWARD_IF_ERROR(FSE_normalizeCount(norm, tableLog, count, nbSeq, max));
-    return FSE_writeNCount(wksp, sizeof(wksp), norm, max, tableLog);
-}
-
-
-typedef enum {
-    ZSTD_defaultDisallowed = 0,
-    ZSTD_defaultAllowed = 1
-} ZSTD_defaultPolicy_e;
-
-MEM_STATIC symbolEncodingType_e
-ZSTD_selectEncodingType(
-        FSE_repeat* repeatMode, unsigned const* count, unsigned const max,
-        size_t const mostFrequent, size_t nbSeq, unsigned const FSELog,
-        FSE_CTable const* prevCTable,
-        short const* defaultNorm, U32 defaultNormLog,
-        ZSTD_defaultPolicy_e const isDefaultAllowed,
-        ZSTD_strategy const strategy)
-{
-    ZSTD_STATIC_ASSERT(ZSTD_defaultDisallowed == 0 && ZSTD_defaultAllowed != 0);
-    if (mostFrequent == nbSeq) {
-        *repeatMode = FSE_repeat_none;
-        if (isDefaultAllowed && nbSeq <= 2) {
-            /* Prefer set_basic over set_rle when there are 2 or less symbols,
-             * since RLE uses 1 byte, but set_basic uses 5-6 bits per symbol.
-             * If basic encoding isn't possible, always choose RLE.
-             */
-            DEBUGLOG(5, "Selected set_basic");
-            return set_basic;
-        }
-        DEBUGLOG(5, "Selected set_rle");
-        return set_rle;
-    }
-    if (strategy < ZSTD_lazy) {
-        if (isDefaultAllowed) {
-            size_t const staticFse_nbSeq_max = 1000;
-            size_t const mult = 10 - strategy;
-            size_t const baseLog = 3;
-            size_t const dynamicFse_nbSeq_min = (((size_t)1 << defaultNormLog) * mult) >> baseLog;  /* 28-36 for offset, 56-72 for lengths */
-            assert(defaultNormLog >= 5 && defaultNormLog <= 6);  /* xx_DEFAULTNORMLOG */
-            assert(mult <= 9 && mult >= 7);
-            if ( (*repeatMode == FSE_repeat_valid)
-              && (nbSeq < staticFse_nbSeq_max) ) {
-                DEBUGLOG(5, "Selected set_repeat");
-                return set_repeat;
-            }
-            if ( (nbSeq < dynamicFse_nbSeq_min)
-              || (mostFrequent < (nbSeq >> (defaultNormLog-1))) ) {
-                DEBUGLOG(5, "Selected set_basic");
-                /* The format allows default tables to be repeated, but it isn't useful.
-                 * When using simple heuristics to select encoding type, we don't want
-                 * to confuse these tables with dictionaries. When running more careful
-                 * analysis, we don't need to waste time checking both repeating tables
-                 * and default tables.
-                 */
-                *repeatMode = FSE_repeat_none;
-                return set_basic;
-            }
-        }
-    } else {
-        size_t const basicCost = isDefaultAllowed ? ZSTD_crossEntropyCost(defaultNorm, defaultNormLog, count, max) : ERROR(GENERIC);
-        size_t const repeatCost = *repeatMode != FSE_repeat_none ? ZSTD_fseBitCost(prevCTable, count, max) : ERROR(GENERIC);
-        size_t const NCountCost = ZSTD_NCountCost(count, max, nbSeq, FSELog);
-        size_t const compressedCost = (NCountCost << 3) + ZSTD_entropyCost(count, max, nbSeq);
-
-        if (isDefaultAllowed) {
-            assert(!ZSTD_isError(basicCost));
-            assert(!(*repeatMode == FSE_repeat_valid && ZSTD_isError(repeatCost)));
-        }
-        assert(!ZSTD_isError(NCountCost));
-        assert(compressedCost < ERROR(maxCode));
-        DEBUGLOG(5, "Estimated bit costs: basic=%u\trepeat=%u\tcompressed=%u",
-                    (unsigned)basicCost, (unsigned)repeatCost, (unsigned)compressedCost);
-        if (basicCost <= repeatCost && basicCost <= compressedCost) {
-            DEBUGLOG(5, "Selected set_basic");
-            assert(isDefaultAllowed);
-            *repeatMode = FSE_repeat_none;
-            return set_basic;
-        }
-        if (repeatCost <= compressedCost) {
-            DEBUGLOG(5, "Selected set_repeat");
-            assert(!ZSTD_isError(repeatCost));
-            return set_repeat;
-        }
-        assert(compressedCost < basicCost && compressedCost < repeatCost);
-    }
-    DEBUGLOG(5, "Selected set_compressed");
-    *repeatMode = FSE_repeat_check;
-    return set_compressed;
-}
-
-MEM_STATIC size_t
-ZSTD_buildCTable(void* dst, size_t dstCapacity,
-                FSE_CTable* nextCTable, U32 FSELog, symbolEncodingType_e type,
-                unsigned* count, U32 max,
-                const BYTE* codeTable, size_t nbSeq,
-                const S16* defaultNorm, U32 defaultNormLog, U32 defaultMax,
-                const FSE_CTable* prevCTable, size_t prevCTableSize,
-                void* workspace, size_t workspaceSize)
-{
-    BYTE* op = (BYTE*)dst;
-    const BYTE* const oend = op + dstCapacity;
-    DEBUGLOG(6, "ZSTD_buildCTable (dstCapacity=%u)", (unsigned)dstCapacity);
-
-    switch (type) {
-    case set_rle:
-        FORWARD_IF_ERROR(FSE_buildCTable_rle(nextCTable, (BYTE)max));
-        RETURN_ERROR_IF(dstCapacity==0, dstSize_tooSmall);
-        *op = codeTable[0];
-        return 1;
-    case set_repeat:
-        memcpy(nextCTable, prevCTable, prevCTableSize);
-        return 0;
-    case set_basic:
-        FORWARD_IF_ERROR(FSE_buildCTable_wksp(nextCTable, defaultNorm, defaultMax, defaultNormLog, workspace, workspaceSize));  /* note : could be pre-calculated */
-        return 0;
-    case set_compressed: {
-        S16 norm[MaxSeq + 1];
-        size_t nbSeq_1 = nbSeq;
-        const U32 tableLog = FSE_optimalTableLog(FSELog, nbSeq, max);
-        if (count[codeTable[nbSeq-1]] > 1) {
-            count[codeTable[nbSeq-1]]--;
-            nbSeq_1--;
-        }
-        assert(nbSeq_1 > 1);
-        FORWARD_IF_ERROR(FSE_normalizeCount(norm, tableLog, count, nbSeq_1, max));
-        {   size_t const NCountSize = FSE_writeNCount(op, oend - op, norm, max, tableLog);   /* overflow protected */
-            FORWARD_IF_ERROR(NCountSize);
-            FORWARD_IF_ERROR(FSE_buildCTable_wksp(nextCTable, norm, max, tableLog, workspace, workspaceSize));
-            return NCountSize;
-        }
-    }
-    default: assert(0); RETURN_ERROR(GENERIC);
-    }
-}
-
-FORCE_INLINE_TEMPLATE size_t
-ZSTD_encodeSequences_body(
-            void* dst, size_t dstCapacity,
-            FSE_CTable const* CTable_MatchLength, BYTE const* mlCodeTable,
-            FSE_CTable const* CTable_OffsetBits, BYTE const* ofCodeTable,
-            FSE_CTable const* CTable_LitLength, BYTE const* llCodeTable,
-            seqDef const* sequences, size_t nbSeq, int longOffsets)
-{
-    BIT_CStream_t blockStream;
-    FSE_CState_t  stateMatchLength;
-    FSE_CState_t  stateOffsetBits;
-    FSE_CState_t  stateLitLength;
-
-    RETURN_ERROR_IF(
-        ERR_isError(BIT_initCStream(&blockStream, dst, dstCapacity)),
-        dstSize_tooSmall, "not enough space remaining");
-    DEBUGLOG(6, "available space for bitstream : %i  (dstCapacity=%u)",
-                (int)(blockStream.endPtr - blockStream.startPtr),
-                (unsigned)dstCapacity);
-
-    /* first symbols */
-    FSE_initCState2(&stateMatchLength, CTable_MatchLength, mlCodeTable[nbSeq-1]);
-    FSE_initCState2(&stateOffsetBits,  CTable_OffsetBits,  ofCodeTable[nbSeq-1]);
-    FSE_initCState2(&stateLitLength,   CTable_LitLength,   llCodeTable[nbSeq-1]);
-    BIT_addBits(&blockStream, sequences[nbSeq-1].litLength, LL_bits[llCodeTable[nbSeq-1]]);
-    if (MEM_32bits()) BIT_flushBits(&blockStream);
-    BIT_addBits(&blockStream, sequences[nbSeq-1].matchLength, ML_bits[mlCodeTable[nbSeq-1]]);
-    if (MEM_32bits()) BIT_flushBits(&blockStream);
-    if (longOffsets) {
-        U32 const ofBits = ofCodeTable[nbSeq-1];
-        int const extraBits = ofBits - MIN(ofBits, STREAM_ACCUMULATOR_MIN-1);
-        if (extraBits) {
-            BIT_addBits(&blockStream, sequences[nbSeq-1].offset, extraBits);
-            BIT_flushBits(&blockStream);
-        }
-        BIT_addBits(&blockStream, sequences[nbSeq-1].offset >> extraBits,
-                    ofBits - extraBits);
-    } else {
-        BIT_addBits(&blockStream, sequences[nbSeq-1].offset, ofCodeTable[nbSeq-1]);
-    }
-    BIT_flushBits(&blockStream);
-
-    {   size_t n;
-        for (n=nbSeq-2 ; n<nbSeq ; n--) {      /* intentional underflow */
-            BYTE const llCode = llCodeTable[n];
-            BYTE const ofCode = ofCodeTable[n];
-            BYTE const mlCode = mlCodeTable[n];
-            U32  const llBits = LL_bits[llCode];
-            U32  const ofBits = ofCode;
-            U32  const mlBits = ML_bits[mlCode];
-            DEBUGLOG(6, "encoding: litlen:%2u - matchlen:%2u - offCode:%7u",
-                        (unsigned)sequences[n].litLength,
-                        (unsigned)sequences[n].matchLength + MINMATCH,
-                        (unsigned)sequences[n].offset);
-                                                                            /* 32b*/  /* 64b*/
-                                                                            /* (7)*/  /* (7)*/
-            FSE_encodeSymbol(&blockStream, &stateOffsetBits, ofCode);       /* 15 */  /* 15 */
-            FSE_encodeSymbol(&blockStream, &stateMatchLength, mlCode);      /* 24 */  /* 24 */
-            if (MEM_32bits()) BIT_flushBits(&blockStream);                  /* (7)*/
-            FSE_encodeSymbol(&blockStream, &stateLitLength, llCode);        /* 16 */  /* 33 */
-            if (MEM_32bits() || (ofBits+mlBits+llBits >= 64-7-(LLFSELog+MLFSELog+OffFSELog)))
-                BIT_flushBits(&blockStream);                                /* (7)*/
-            BIT_addBits(&blockStream, sequences[n].litLength, llBits);
-            if (MEM_32bits() && ((llBits+mlBits)>24)) BIT_flushBits(&blockStream);
-            BIT_addBits(&blockStream, sequences[n].matchLength, mlBits);
-            if (MEM_32bits() || (ofBits+mlBits+llBits > 56)) BIT_flushBits(&blockStream);
-            if (longOffsets) {
-                int const extraBits = ofBits - MIN(ofBits, STREAM_ACCUMULATOR_MIN-1);
-                if (extraBits) {
-                    BIT_addBits(&blockStream, sequences[n].offset, extraBits);
-                    BIT_flushBits(&blockStream);                            /* (7)*/
-                }
-                BIT_addBits(&blockStream, sequences[n].offset >> extraBits,
-                            ofBits - extraBits);                            /* 31 */
-            } else {
-                BIT_addBits(&blockStream, sequences[n].offset, ofBits);     /* 31 */
-            }
-            BIT_flushBits(&blockStream);                                    /* (7)*/
-            DEBUGLOG(7, "remaining space : %i", (int)(blockStream.endPtr - blockStream.ptr));
-    }   }
-
-    DEBUGLOG(6, "ZSTD_encodeSequences: flushing ML state with %u bits", stateMatchLength.stateLog);
-    FSE_flushCState(&blockStream, &stateMatchLength);
-    DEBUGLOG(6, "ZSTD_encodeSequences: flushing Off state with %u bits", stateOffsetBits.stateLog);
-    FSE_flushCState(&blockStream, &stateOffsetBits);
-    DEBUGLOG(6, "ZSTD_encodeSequences: flushing LL state with %u bits", stateLitLength.stateLog);
-    FSE_flushCState(&blockStream, &stateLitLength);
-
-    {   size_t const streamSize = BIT_closeCStream(&blockStream);
-        RETURN_ERROR_IF(streamSize==0, dstSize_tooSmall, "not enough space");
-        return streamSize;
-    }
-}
-
-static size_t
-ZSTD_encodeSequences_default(
-            void* dst, size_t dstCapacity,
-            FSE_CTable const* CTable_MatchLength, BYTE const* mlCodeTable,
-            FSE_CTable const* CTable_OffsetBits, BYTE const* ofCodeTable,
-            FSE_CTable const* CTable_LitLength, BYTE const* llCodeTable,
-            seqDef const* sequences, size_t nbSeq, int longOffsets)
-{
-    return ZSTD_encodeSequences_body(dst, dstCapacity,
-                                    CTable_MatchLength, mlCodeTable,
-                                    CTable_OffsetBits, ofCodeTable,
-                                    CTable_LitLength, llCodeTable,
-                                    sequences, nbSeq, longOffsets);
-}
-
-
-#if DYNAMIC_BMI2
-
-static TARGET_ATTRIBUTE("bmi2") size_t
-ZSTD_encodeSequences_bmi2(
-            void* dst, size_t dstCapacity,
-            FSE_CTable const* CTable_MatchLength, BYTE const* mlCodeTable,
-            FSE_CTable const* CTable_OffsetBits, BYTE const* ofCodeTable,
-            FSE_CTable const* CTable_LitLength, BYTE const* llCodeTable,
-            seqDef const* sequences, size_t nbSeq, int longOffsets)
-{
-    return ZSTD_encodeSequences_body(dst, dstCapacity,
-                                    CTable_MatchLength, mlCodeTable,
-                                    CTable_OffsetBits, ofCodeTable,
-                                    CTable_LitLength, llCodeTable,
-                                    sequences, nbSeq, longOffsets);
-}
-
-#endif
-
-static size_t ZSTD_encodeSequences(
-            void* dst, size_t dstCapacity,
-            FSE_CTable const* CTable_MatchLength, BYTE const* mlCodeTable,
-            FSE_CTable const* CTable_OffsetBits, BYTE const* ofCodeTable,
-            FSE_CTable const* CTable_LitLength, BYTE const* llCodeTable,
-            seqDef const* sequences, size_t nbSeq, int longOffsets, int bmi2)
-{
-    DEBUGLOG(5, "ZSTD_encodeSequences: dstCapacity = %u", (unsigned)dstCapacity);
-#if DYNAMIC_BMI2
-    if (bmi2) {
-        return ZSTD_encodeSequences_bmi2(dst, dstCapacity,
-                                         CTable_MatchLength, mlCodeTable,
-                                         CTable_OffsetBits, ofCodeTable,
-                                         CTable_LitLength, llCodeTable,
-                                         sequences, nbSeq, longOffsets);
-    }
-#endif
-    (void)bmi2;
-    return ZSTD_encodeSequences_default(dst, dstCapacity,
-                                        CTable_MatchLength, mlCodeTable,
-                                        CTable_OffsetBits, ofCodeTable,
-                                        CTable_LitLength, llCodeTable,
-                                        sequences, nbSeq, longOffsets);
-}
-
 static int ZSTD_disableLiteralsCompression(const ZSTD_CCtx_params* cctxParams)
 {
     switch (cctxParams->literalCompressionMode) {
@@ -2460,6 +2014,16 @@ static int ZSTD_disableLiteralsCompression(const ZSTD_CCtx_params* cctxParams)
     case ZSTD_lcm_auto:
         return (cctxParams->cParams.strategy == ZSTD_fast) && (cctxParams->cParams.targetLength > 0);
     }
+}
+
+/* ZSTD_useTargetCBlockSize():
+ * Returns if target compressed block size param is being used.
+ * If used, compression will do best effort to make a compressed block size to be around targetCBlockSize.
+ * Returns 1 if true, 0 otherwise. */
+static int ZSTD_useTargetCBlockSize(const ZSTD_CCtx_params* cctxParams)
+{
+    DEBUGLOG(5, "ZSTD_useTargetCBlockSize (targetCBlockSize=%zu)", cctxParams->targetCBlockSize);
+    return (cctxParams->targetCBlockSize != 0);
 }
 
 /* ZSTD_compressSequences_internal():
@@ -2491,8 +2055,8 @@ ZSTD_compressSequences_internal(seqStore_t* seqStorePtr,
     BYTE* seqHead;
     BYTE* lastNCount = NULL;
 
+    DEBUGLOG(5, "ZSTD_compressSequences_internal (nbSeq=%zu)", nbSeq);
     ZSTD_STATIC_ASSERT(HUF_WORKSPACE_SIZE >= (1<<MAX(MLFSELog,LLFSELog)));
-    DEBUGLOG(5, "ZSTD_compressSequences_internal");
 
     /* Compress literals */
     {   const BYTE* const literals = seqStorePtr->litStart;
@@ -2716,30 +2280,24 @@ void ZSTD_resetSeqStore(seqStore_t* ssPtr)
     ssPtr->longLengthID = 0;
 }
 
-static size_t ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
-                                        void* dst, size_t dstCapacity,
-                                        const void* src, size_t srcSize)
+typedef enum { ZSTDbss_compress, ZSTDbss_noCompress } ZSTD_buildSeqStore_e;
+
+static size_t ZSTD_buildSeqStore(ZSTD_CCtx* zc, const void* src, size_t srcSize)
 {
     ZSTD_matchState_t* const ms = &zc->blockState.matchState;
-    size_t cSize;
-    DEBUGLOG(5, "ZSTD_compressBlock_internal (dstCapacity=%u, dictLimit=%u, nextToUpdate=%u)",
-                (unsigned)dstCapacity, (unsigned)ms->window.dictLimit, (unsigned)ms->nextToUpdate);
+    DEBUGLOG(5, "ZSTD_buildSeqStore (srcSize=%zu)", srcSize);
     assert(srcSize <= ZSTD_BLOCKSIZE_MAX);
-
     /* Assert that we have correctly flushed the ctx params into the ms's copy */
     ZSTD_assertEqualCParams(zc->appliedParams.cParams, ms->cParams);
-
     if (srcSize < MIN_CBLOCK_SIZE+ZSTD_blockHeaderSize+1) {
         ZSTD_ldm_skipSequences(&zc->externSeqStore, srcSize, zc->appliedParams.cParams.minMatch);
-        cSize = 0;
-        goto out;  /* don't even attempt compression below a certain srcSize */
+        return ZSTDbss_noCompress; /* don't even attempt compression below a certain srcSize */
     }
     ZSTD_resetSeqStore(&(zc->seqStore));
     /* required for optimal parser to read stats from dictionary */
     ms->opt.symbolCosts = &zc->blockState.prevCBlock->entropy;
     /* tell the optimal parser how we expect to compress literals */
     ms->opt.literalCompressionMode = zc->appliedParams.literalCompressionMode;
-
     /* a gap between an attached dict and the current window is not safe,
      * they must remain adjacent,
      * and when that stops being the case, the dict must be unset */
@@ -2793,6 +2351,21 @@ static size_t ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
         {   const BYTE* const lastLiterals = (const BYTE*)src + srcSize - lastLLSize;
             ZSTD_storeLastLiterals(&zc->seqStore, lastLiterals, lastLLSize);
     }   }
+    return ZSTDbss_compress;
+}
+
+static size_t ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
+                                        void* dst, size_t dstCapacity,
+                                        const void* src, size_t srcSize)
+{
+    size_t bss;
+    size_t cSize;
+    DEBUGLOG(5, "ZSTD_compressBlock_internal (dstCapacity=%u, dictLimit=%u, nextToUpdate=%u)",
+                (unsigned)dstCapacity, (unsigned)zc->blockState.matchState.window.dictLimit, (unsigned)zc->blockState.matchState.nextToUpdate);
+
+    bss = ZSTD_buildSeqStore(zc, src, srcSize);
+    FORWARD_IF_ERROR(bss);
+    if (bss == ZSTDbss_noCompress) { cSize = 0; goto out; }
 
     /* encode sequences and literals */
     cSize = ZSTD_compressSequences(&zc->seqStore,
@@ -2820,6 +2393,39 @@ out:
     return cSize;
 }
 
+static size_t ZSTD_compressSuperBlock(ZSTD_CCtx* zc,
+                               void* dst, size_t dstCapacity,
+                               const void* src, size_t srcSize,
+                               U32 lastBlock) {
+    size_t cSize = 0;
+    DEBUGLOG(5, "ZSTD_compressSuperBlock (dstCapacity=%u, dictLimit=%u, nextToUpdate=%u, srcSize=%zu)",
+                (unsigned)dstCapacity, (unsigned)zc->blockState.matchState.window.dictLimit, (unsigned)zc->blockState.matchState.nextToUpdate, srcSize);
+
+    {   size_t bss = ZSTD_buildSeqStore(zc, src, srcSize);
+        FORWARD_IF_ERROR(bss);
+        if (bss == ZSTDbss_compress) {
+            cSize = ZSTD_compressSuperBlock_internal(zc, dst, dstCapacity, src, srcSize, lastBlock);
+    }   }
+
+    if (!ZSTD_isError(cSize) && cSize != 0) {
+        /* confirm repcodes and entropy tables when emitting a compressed block */
+        ZSTD_compressedBlockState_t* const tmp = zc->blockState.prevCBlock;
+        zc->blockState.prevCBlock = zc->blockState.nextCBlock;
+        zc->blockState.nextCBlock = tmp;
+    }
+    /* We check that dictionaries have offset codes available for the first
+     * block. After the first block, the offcode table might not have large
+     * enough codes to represent the offsets in the data.
+     */
+    if (zc->blockState.prevCBlock->entropy.fse.offcode_repeatMode == FSE_repeat_valid)
+        zc->blockState.prevCBlock->entropy.fse.offcode_repeatMode = FSE_repeat_check;
+
+    if (cSize == 0) {
+      cSize = ZSTD_noCompressBlock(dst, dstCapacity, src, srcSize, lastBlock);
+    }
+    assert(cSize != 0);
+    return cSize;
+}
 
 /*! ZSTD_compress_frameChunk() :
 *   Compress a chunk of data into one or multiple blocks.
@@ -2872,19 +2478,27 @@ static size_t ZSTD_compress_frameChunk (ZSTD_CCtx* cctx,
         /* Ensure hash/chain table insertion resumes no sooner than lowlimit */
         if (ms->nextToUpdate < ms->window.lowLimit) ms->nextToUpdate = ms->window.lowLimit;
 
-        {   size_t cSize = ZSTD_compressBlock_internal(cctx,
-                                op+ZSTD_blockHeaderSize, dstCapacity-ZSTD_blockHeaderSize,
-                                ip, blockSize);
-            FORWARD_IF_ERROR(cSize);
-
-            if (cSize == 0) {  /* block is not compressible */
-                cSize = ZSTD_noCompressBlock(op, dstCapacity, ip, blockSize, lastBlock);
+        {   int useTargetCBlockSize = ZSTD_useTargetCBlockSize(&cctx->appliedParams);
+            size_t cSize;
+            if (useTargetCBlockSize) {
+                cSize = ZSTD_compressSuperBlock(cctx, op, dstCapacity, ip, blockSize, lastBlock);
                 FORWARD_IF_ERROR(cSize);
             } else {
-                U32 const cBlockHeader24 = lastBlock + (((U32)bt_compressed)<<1) + (U32)(cSize << 3);
-                MEM_writeLE24(op, cBlockHeader24);
-                cSize += ZSTD_blockHeaderSize;
+                cSize = ZSTD_compressBlock_internal(cctx,
+                                        op+ZSTD_blockHeaderSize, dstCapacity-ZSTD_blockHeaderSize,
+                                        ip, blockSize);
+                FORWARD_IF_ERROR(cSize);
+
+                if (cSize == 0) {  /* block is not compressible */
+                    cSize = ZSTD_noCompressBlock(op, dstCapacity, ip, blockSize, lastBlock);
+                    FORWARD_IF_ERROR(cSize);
+                } else {
+                    U32 const cBlockHeader24 = lastBlock + (((U32)bt_compressed)<<1) + (U32)(cSize << 3);
+                    MEM_writeLE24(op, cBlockHeader24);
+                    cSize += ZSTD_blockHeaderSize;
+                }
             }
+
 
             ip += blockSize;
             assert(remaining >= blockSize);
