@@ -400,18 +400,6 @@ ZSTD_bounds ZSTD_cParam_getBounds(ZSTD_cParameter param)
     }
 }
 
-/* ZSTD_cParam_withinBounds:
- * @return 1 if value is within cParam bounds,
- * 0 otherwise */
-static int ZSTD_cParam_withinBounds(ZSTD_cParameter cParam, int value)
-{
-    ZSTD_bounds const bounds = ZSTD_cParam_getBounds(cParam);
-    if (ZSTD_isError(bounds.error)) return 0;
-    if (value < bounds.lowerBound) return 0;
-    if (value > bounds.upperBound) return 0;
-    return 1;
-}
-
 /* ZSTD_cParam_clampBounds:
  * Clamps the value into the bounded range.
  */
@@ -1883,102 +1871,6 @@ static size_t ZSTD_noCompressBlock (void* dst, size_t dstCapacity, const void* s
     return ZSTD_blockHeaderSize + srcSize;
 }
 
-/* ZSTD_minGain() :
- * minimum compression required
- * to generate a compress block or a compressed literals section.
- * note : use same formula for both situations */
-static size_t ZSTD_minGain(size_t srcSize, ZSTD_strategy strat)
-{
-    U32 const minlog = (strat>=ZSTD_btultra) ? (U32)(strat) - 1 : 6;
-    ZSTD_STATIC_ASSERT(ZSTD_btultra == 8);
-    assert(ZSTD_cParam_withinBounds(ZSTD_c_strategy, strat));
-    return (srcSize >> minlog) + 2;
-}
-
-static size_t ZSTD_compressLiterals (ZSTD_hufCTables_t const* prevHuf,
-                                     ZSTD_hufCTables_t* nextHuf,
-                                     ZSTD_strategy strategy, int disableLiteralCompression,
-                                     void* dst, size_t dstCapacity,
-                               const void* src, size_t srcSize,
-                                     void* workspace, size_t wkspSize,
-                               const int bmi2)
-{
-    size_t const minGain = ZSTD_minGain(srcSize, strategy);
-    size_t const lhSize = 3 + (srcSize >= 1 KB) + (srcSize >= 16 KB);
-    BYTE*  const ostart = (BYTE*)dst;
-    U32 singleStream = srcSize < 256;
-    symbolEncodingType_e hType = set_compressed;
-    size_t cLitSize;
-
-    DEBUGLOG(5,"ZSTD_compressLiterals (disableLiteralCompression=%i)",
-                disableLiteralCompression);
-
-    /* Prepare nextEntropy assuming reusing the existing table */
-    memcpy(nextHuf, prevHuf, sizeof(*prevHuf));
-
-    if (disableLiteralCompression)
-        return ZSTD_noCompressLiterals(dst, dstCapacity, src, srcSize);
-
-    /* small ? don't even attempt compression (speed opt) */
-#   define COMPRESS_LITERALS_SIZE_MIN 63
-    {   size_t const minLitSize = (prevHuf->repeatMode == HUF_repeat_valid) ? 6 : COMPRESS_LITERALS_SIZE_MIN;
-        if (srcSize <= minLitSize) return ZSTD_noCompressLiterals(dst, dstCapacity, src, srcSize);
-    }
-
-    RETURN_ERROR_IF(dstCapacity < lhSize+1, dstSize_tooSmall, "not enough space for compression");
-    {   HUF_repeat repeat = prevHuf->repeatMode;
-        int const preferRepeat = strategy < ZSTD_lazy ? srcSize <= 1024 : 0;
-        if (repeat == HUF_repeat_valid && lhSize == 3) singleStream = 1;
-        cLitSize = singleStream ? HUF_compress1X_repeat(ostart+lhSize, dstCapacity-lhSize, src, srcSize, 255, 11,
-                                      workspace, wkspSize, (HUF_CElt*)nextHuf->CTable, &repeat, preferRepeat, bmi2)
-                                : HUF_compress4X_repeat(ostart+lhSize, dstCapacity-lhSize, src, srcSize, 255, 11,
-                                      workspace, wkspSize, (HUF_CElt*)nextHuf->CTable, &repeat, preferRepeat, bmi2);
-        if (repeat != HUF_repeat_none) {
-            /* reused the existing table */
-            hType = set_repeat;
-        }
-    }
-
-    if ((cLitSize==0) | (cLitSize >= srcSize - minGain) | ERR_isError(cLitSize)) {
-        memcpy(nextHuf, prevHuf, sizeof(*prevHuf));
-        return ZSTD_noCompressLiterals(dst, dstCapacity, src, srcSize);
-    }
-    if (cLitSize==1) {
-        memcpy(nextHuf, prevHuf, sizeof(*prevHuf));
-        return ZSTD_compressRleLiteralsBlock(dst, dstCapacity, src, srcSize);
-    }
-
-    if (hType == set_compressed) {
-        /* using a newly constructed table */
-        nextHuf->repeatMode = HUF_repeat_check;
-    }
-
-    /* Build header */
-    switch(lhSize)
-    {
-    case 3: /* 2 - 2 - 10 - 10 */
-        {   U32 const lhc = hType + ((!singleStream) << 2) + ((U32)srcSize<<4) + ((U32)cLitSize<<14);
-            MEM_writeLE24(ostart, lhc);
-            break;
-        }
-    case 4: /* 2 - 2 - 14 - 14 */
-        {   U32 const lhc = hType + (2 << 2) + ((U32)srcSize<<4) + ((U32)cLitSize<<18);
-            MEM_writeLE32(ostart, lhc);
-            break;
-        }
-    case 5: /* 2 - 2 - 18 - 18 */
-        {   U32 const lhc = hType + (3 << 2) + ((U32)srcSize<<4) + ((U32)cLitSize<<22);
-            MEM_writeLE32(ostart, lhc);
-            ostart[4] = (BYTE)(cLitSize >> 10);
-            break;
-        }
-    default:  /* not possible : lhSize is {3,4,5} */
-        assert(0);
-    }
-    return lhSize+cLitSize;
-}
-
-
 void ZSTD_seqToCodes(const seqStore_t* seqStorePtr)
 {
     const seqDef* const sequences = seqStorePtr->sequencesStart;
@@ -2358,14 +2250,14 @@ static size_t ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
                                         void* dst, size_t dstCapacity,
                                         const void* src, size_t srcSize)
 {
-    size_t bss;
     size_t cSize;
     DEBUGLOG(5, "ZSTD_compressBlock_internal (dstCapacity=%u, dictLimit=%u, nextToUpdate=%u)",
                 (unsigned)dstCapacity, (unsigned)zc->blockState.matchState.window.dictLimit, (unsigned)zc->blockState.matchState.nextToUpdate);
 
-    bss = ZSTD_buildSeqStore(zc, src, srcSize);
-    FORWARD_IF_ERROR(bss);
-    if (bss == ZSTDbss_noCompress) { cSize = 0; goto out; }
+    {   const size_t bss = ZSTD_buildSeqStore(zc, src, srcSize);
+        FORWARD_IF_ERROR(bss);
+        if (bss == ZSTDbss_noCompress) { cSize = 0; goto out; }
+    }
 
     /* encode sequences and literals */
     cSize = ZSTD_compressSequences(&zc->seqStore,
@@ -2401,10 +2293,10 @@ static size_t ZSTD_compressSuperBlock(ZSTD_CCtx* zc,
     DEBUGLOG(5, "ZSTD_compressSuperBlock (dstCapacity=%u, dictLimit=%u, nextToUpdate=%u, srcSize=%zu)",
                 (unsigned)dstCapacity, (unsigned)zc->blockState.matchState.window.dictLimit, (unsigned)zc->blockState.matchState.nextToUpdate, srcSize);
 
-    {   size_t bss = ZSTD_buildSeqStore(zc, src, srcSize);
+    {   const size_t bss = ZSTD_buildSeqStore(zc, src, srcSize);
         FORWARD_IF_ERROR(bss);
         if (bss == ZSTDbss_compress) {
-            cSize = ZSTD_compressSuperBlock_internal(zc, dst, dstCapacity, src, srcSize, lastBlock);
+            cSize = ZSTD_compressSuperBlock_internal(zc, dst, dstCapacity, lastBlock);
     }   }
 
     if (!ZSTD_isError(cSize) && cSize != 0) {

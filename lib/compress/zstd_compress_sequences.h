@@ -11,9 +11,8 @@
 #ifndef ZSTD_COMPRESS_SEQUENCES_H
 #define ZSTD_COMPRESS_SEQUENCES_H
 
-// #define FSE_STATIC_LINKING_ONLY   /* FSE_encodeSymbol */ TODO is this necessary?
-#include "fse.h"
-#include "zstd_internal.h"
+#include "fse.h" /* FSE_repeat, FSE_CTable */
+#include "zstd_internal.h" /* symbolEncodingType_e, ZSTD_strategy */
 
 typedef enum {
     ZSTD_defaultDisallowed = 0,

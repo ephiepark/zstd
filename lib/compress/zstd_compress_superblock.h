@@ -15,12 +15,7 @@
 *  Dependencies
 ***************************************/
 
-#include "zstd_internal.h"
-
-
-// #if defined (__cplusplus) TODO are these necessary?
-// extern "C" {
-// #endif
+#include "zstd.h" /* ZSTD_CCtx */
 
 /*-*************************************
 *  Target Compressed Block Size
@@ -31,7 +26,6 @@
  * The given block will be compressed into multiple sub blocks that are around targetCBlockSize. */
 size_t ZSTD_compressSuperBlock_internal(ZSTD_CCtx* zc,
                                void* dst, size_t dstCapacity,
-                               const void* src, size_t srcSize,
                                U32 lastBlock);
 
 #endif /* ZSTD_COMPRESS_ADVANCED_H */
